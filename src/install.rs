@@ -119,7 +119,52 @@ fn normalise_links(lib: &Path) -> Result<()> {
             symlink(target, p)?;
         }
     }
+    for entry in fs::read_dir(lib)?.flatten() {
+        let path = entry.path();
+        if !path.is_file() || path.is_symlink() {
+            continue;
+        }
+        if let Some(soname) = soname(&fs::read(&path)?) {
+            let link = lib.join(&soname);
+            if soname != entry.file_name().to_string_lossy() && link.symlink_metadata().is_err() {
+                symlink(entry.file_name(), link)?;
+            }
+        }
+    }
     Ok(())
+}
+
+/// DT_SONAME of a little-endian ELF64 shared object, if it has one.
+fn soname(elf: &[u8]) -> Option<String> {
+    fn uint(b: &[u8], at: usize, len: usize) -> Option<usize> {
+        let raw = b.get(at..at.checked_add(len)?)?;
+        Some(raw.iter().rev().fold(0usize, |a, &x| (a << 8) | x as usize))
+    }
+    if elf.get(..4)? != b"\x7fELF" || *elf.get(4)? != 2 || *elf.get(5)? != 1 {
+        return None;
+    }
+    let shoff = uint(elf, 0x28, 8)?;
+    let shentsize = uint(elf, 0x3a, 2)?;
+    let shnum = uint(elf, 0x3c, 2)?;
+    let section = |i: usize| shoff.checked_add(i.checked_mul(shentsize)?);
+    for i in 0..shnum {
+        let sh = section(i)?;
+        if uint(elf, sh + 4, 4)? != 6 {
+            continue; // not SHT_DYNAMIC
+        }
+        let (off, size) = (uint(elf, sh + 0x18, 8)?, uint(elf, sh + 0x20, 8)?);
+        let strtab = section(uint(elf, sh + 0x28, 4)?)?;
+        let str_off = uint(elf, strtab + 0x18, 8)?;
+        for d in (off..off.checked_add(size)?).step_by(16) {
+            if uint(elf, d, 8)? == 14 {
+                let start = str_off.checked_add(uint(elf, d + 8, 8)?)?;
+                let name = elf.get(start..)?;
+                let end = name.iter().position(|&c| c == 0)?;
+                return String::from_utf8(name[..end].to_vec()).ok();
+            }
+        }
+    }
+    None
 }
 
 fn write_sums(dir: &Path) -> Result<()> {
@@ -212,6 +257,13 @@ fn is_replaced(name: &str) -> bool {
 pub struct Options {
     pub allow_unverified: bool,
     pub allow_downgrade: bool,
+    pub force: bool,
+}
+
+fn installed_sha256(prefix: &Path) -> Option<String> {
+    let lock: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(prefix.join(LOCK)).ok()?).ok()?;
+    Some(lock["artifact"]["sha256"].as_str()?.to_owned())
 }
 
 /// OpenVINO version of whatever ovfetch installed in `prefix` before.
@@ -243,6 +295,17 @@ pub fn install(
              Sources agreed on their hashes, but nothing pins them yet. Pass --allow-unverified to accept that.",
             plan.artifact.id
         );
+    }
+    if !opts.force
+        && installed_sha256(prefix).as_deref() == Some(plan.artifact.sha256.as_str())
+        && verify(prefix).is_ok()
+    {
+        eprintln!(
+            "already installed: {} matches {}; pass --force to reinstall",
+            prefix.display(),
+            plan.artifact.id
+        );
+        return Ok(());
     }
     if prefix.exists() {
         let sums = fs::read_to_string(prefix.join(SUMS)).unwrap_or_default();
@@ -308,6 +371,18 @@ pub fn install(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_soname_from_a_shared_object() {
+        let Some(libc) = ["/lib/x86_64-linux-gnu/libc.so.6", "/usr/lib64/libc.so.6"]
+            .iter()
+            .find_map(|p| fs::read(p).ok())
+        else {
+            return;
+        };
+        assert_eq!(soname(&libc).as_deref(), Some("libc.so.6"));
+        assert_eq!(soname(b"not elf"), None);
+    }
 
     #[test]
     fn verify_flags_files_it_did_not_write() {
