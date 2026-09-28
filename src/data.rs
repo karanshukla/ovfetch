@@ -2,6 +2,7 @@
 //! carries the exact ledger it was reviewed with; `--data-dir` reads a checkout
 //! instead, which is how CI edits them.
 
+use crate::version::Ver;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -41,8 +42,25 @@ pub struct NpuDrivers {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NpuDriver {
     pub version: String,
+    /// The OpenVINO Intel's release notes pair this driver with.
     pub openvino: String,
     pub platforms: Vec<String>,
+    /// A newer OpenVINO measured compiling on this driver; `ci discover` never
+    /// writes it, so it survives regeneration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_openvino: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_note: Option<String>,
+}
+
+impl NpuDriver {
+    /// Newest OpenVINO known to compile on this driver: Intel's pairing, or a
+    /// newer one measured by hand.
+    pub fn max_openvino(&self) -> Option<Ver> {
+        let paired = Ver::parse(&self.openvino);
+        let measured = self.measured_openvino.as_deref().and_then(Ver::parse);
+        paired.max(measured)
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

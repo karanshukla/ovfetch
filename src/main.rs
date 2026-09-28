@@ -25,7 +25,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Print the detected NPU/GPU and NPU userspace.
+    /// Print the detected NPU/GPU, NPU userspace, and what the data says about them. Offline.
     Detect,
     /// Work out which artifacts to install, and check their hashes, without downloading.
     Resolve {
@@ -80,7 +80,13 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let data = data::Data::load(cli.data_dir.as_deref())?;
     match cli.command {
-        Cmd::Detect => println!("{}", serde_json::to_string_pretty(&detect::machine())?),
+        Cmd::Detect => {
+            let machine = detect::machine();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&resolve::status(&machine, &data))?
+            );
+        }
         Cmd::Resolve {
             min_openvino,
             ignore_driver,
@@ -101,7 +107,7 @@ fn main() -> Result<()> {
                     plan.floor.reason
                 );
                 if let Some(c) = &plan.driver_ceiling {
-                    println!("ceiling:  {c} (newest the installed NPU driver pairs with)");
+                    println!("ceiling:  {c} (newest known to compile on the installed NPU driver)");
                 }
                 println!(
                     "openvino: {} (onnxruntime-openvino {}, {:?})",
