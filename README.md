@@ -48,7 +48,7 @@ ovfetch verify --prefix /usr/lib64/gaze          # re-hash an install against it
 
 Something every source agrees on but the ledger has never recorded is *unverified*, and `install` refuses it without `--allow-unverified`.
 
-The mirrors are all in China, because those are the large public PyPI mirrors. They catch a tampered CDN edge or a bad mirror, but they copy PyPI, so they cannot catch a compromise at PyPI itself. The ledger is what covers that.
+The mirrors catch a tampered CDN edge or a bad mirror, but they copy PyPI, so they cannot catch a compromise at PyPI itself. The ledger is what covers that.
 
 ## Keeping the data current
 
@@ -75,4 +75,4 @@ Release tags cannot be moved or deleted, and releases are immutable once publish
 
 ## License
 
-MIT or Apache-2.0, at your option.
+MIT.
