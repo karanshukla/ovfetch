@@ -17,7 +17,7 @@ An **Audit** issue labelled `audit-failure` is public by design: it means an ups
 | Malicious new upstream release | A release only enters the ledger after 7 days in public, through a reviewed PR that links each wheel to Intel's matching intel/onnxruntime release. Until then it is *unverified* and `install` refuses it by default. |
 | DNS spoofing / MITM | HTTPS only, rustls with compiled-in roots, fixed host allowlist re-checked after redirects. |
 | Downloaded bytes differ from what the index claims | Bytes are hashed while streaming and must match the agreed hash. The audit also spot-downloads from random mirrors. |
-| Local tampering after install | `ovfetch verify` re-hashes the prefix against the `SHA256SUMS` written at install. |
+| Local tampering after install | `ovfetch verify` re-hashes the prefix against the `SHA256SUMS` written at install and fails on any file it did not write. Install refuses a prefix holding such files rather than deleting them. |
 | Compromised ovfetch release | Tags are immutable, releases are immutable, binaries carry signed build provenance (`gh attestation verify`). |
 | Stolen crates.io token | There is none: crates.io uses trusted publishing from the release workflow, and that job waits for the maintainer's approval in the `crates-io` environment. |
 | PR that weakens the checks (hosts, mirrors, hash agreement, ledger, CI) | The `guard` check fails any PR from someone other than the owner that touches `src/`, `data/`, `.github/`, dependencies, or this file. It runs from main's copy (`pull_request_target`) and never executes PR code, so a PR cannot edit it to pass. Discover's bot PRs may only add ledger entries, never change or remove one. Only the owner's ruleset bypass can merge a flagged PR. |
