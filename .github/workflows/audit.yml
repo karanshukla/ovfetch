@@ -1,0 +1,45 @@
+name: Audit
+
+# Re-checks every hash in data/ledger.toml against PyPI, every mirror, and
+# GitHub, and downloads a random few from a random mirror to hash the bytes.
+# A published artifact's hash must never change, so any difference opens an
+# issue: that is what a compromised package or mirror looks like.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo build --locked --release
+      - name: Audit the ledger
+        id: audit
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: target/release/ovfetch --data-dir data ci audit --sample 3 > report.md 2> errors.txt
+      - name: Open or update the audit issue
+        if: failure() && steps.audit.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          { cat report.md; echo; echo '```'; tail -n 100 errors.txt; echo '```'; echo; echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"; } > body.md
+          existing=$(gh issue list --label audit-failure --state open --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file body.md
+          else
+            gh label create audit-failure --color B60205 --description "ovfetch ci audit found a changed hash" 2>/dev/null || true
+            gh issue create --title "Audit: a recorded hash changed or a source disagrees" --label audit-failure --body-file body.md
+          fi

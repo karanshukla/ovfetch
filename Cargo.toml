@@ -1,0 +1,27 @@
+[package]
+name = "ovfetch"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Resolve, download, and hash-verify the OpenVINO-enabled ONNX Runtime an Intel NPU needs"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/karanshukla/ovfetch"
+readme = "README.md"
+keywords = ["openvino", "onnxruntime", "npu", "intel", "supply-chain"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+hex = "0.4.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+toml = "1.1.6"
+ureq = "2"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
