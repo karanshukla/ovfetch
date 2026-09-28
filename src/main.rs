@@ -163,7 +163,10 @@ fn main() -> Result<()> {
             );
             let changes = ci::discover(&mut data)?;
             data.save()?;
-            println!("{changes}");
+            // The workflow opens a PR only when this prints something.
+            if !changes.is_empty() {
+                println!("{changes}");
+            }
         }
     }
     Ok(())
