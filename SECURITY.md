@@ -19,7 +19,8 @@ An **Audit** issue labelled `audit-failure` is public by design: it means an ups
 | Downloaded bytes differ from what the index claims | Bytes are hashed while streaming and must match the agreed hash. The audit also spot-downloads from random mirrors. |
 | Local tampering after install | `ovfetch verify` re-hashes the prefix against the `SHA256SUMS` written at install. |
 | Compromised ovfetch release | Tags are immutable, releases are immutable, binaries carry signed build provenance (`gh attestation verify`). |
-| Compromised dependency or action | Crates from crates.io only (cargo-deny), `Cargo.lock` enforced, every action pinned to a commit, Renovate waits 7 days and never auto-merges. |
+| Stolen crates.io token | There is none: crates.io uses trusted publishing from the release workflow, and that job waits for the maintainer's approval in the `crates-io` environment. |
+| Compromised dependency or action | Crates from crates.io only (cargo-deny), `Cargo.lock` enforced, every action pinned to a commit, Dependabot waits 7 days and nothing auto-merges. |
 
 ## What it does not defend against
 

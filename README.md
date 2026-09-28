@@ -57,6 +57,14 @@ Two scheduled workflows, so nobody maintains version tables by hand:
 - **Discover** (weekly) records new onnxruntime-openvino wheels, new NPU driver releases with their OpenVINO pairing and asset hashes, and new NPU PCI IDs from the kernel's `ivpu` driver. It opens a PR. Nothing reaches users until that PR is reviewed and a release is cut.
 - **Audit** (daily) re-checks every ledger hash against every source and spot-downloads a random few from a random mirror. Any change opens an issue.
 
+## Installing
+
+```bash
+cargo install ovfetch --locked
+```
+
+Or download the static binary from [Releases](https://github.com/karanshukla/ovfetch/releases) and verify it (below). The binary is the stronger option: its provenance is signed, while `cargo install` compiles whatever crates.io serves.
+
 ## Verifying a release
 
 Release binaries are static (musl) and carry signed build provenance:
