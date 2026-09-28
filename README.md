@@ -52,6 +52,23 @@ Something every source agrees on but the ledger has never recorded is *unverifie
 
 The mirrors catch a tampered CDN edge or a bad mirror, but they copy PyPI, so they cannot catch a compromise at PyPI itself. The ledger is what covers that.
 
+## As a library
+
+The offline half is a library too. Without the default `cli` feature it builds with no network crates (anyhow, serde, and toml only) and never downloads anything:
+
+```toml
+ovfetch = { version = "0.2", default-features = false }
+```
+
+```rust
+let data = ovfetch::data::Data::load(None)?;
+let machine = ovfetch::detect::machine();
+let status = ovfetch::status::status(&machine, &data);
+// status.warnings: missing NPU driver or compiler, a driver older than the platform needs, an NPU the data does not know
+```
+
+Gaze uses this for a `gaze doctor` check.
+
 ## Keeping the data current
 
 Two scheduled workflows, so nobody maintains version tables by hand:

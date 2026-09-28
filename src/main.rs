@@ -1,15 +1,6 @@
-mod ci;
-mod consensus;
-mod data;
-mod detect;
-mod install;
-mod net;
-mod resolve;
-mod sources;
-mod version;
-
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use ovfetch::{ci, data, detect, install, resolve, sources, status};
 use std::path::PathBuf;
 
 /// Resolve, download, and verify the OpenVINO build this machine's Intel NPU needs.
@@ -84,7 +75,7 @@ fn main() -> Result<()> {
             let machine = detect::machine();
             println!(
                 "{}",
-                serde_json::to_string_pretty(&resolve::status(&machine, &data))?
+                serde_json::to_string_pretty(&status::status(&machine, &data))?
             );
         }
         Cmd::Resolve {
