@@ -44,6 +44,9 @@ enum Cmd {
         /// Replace a newer OpenVINO that ovfetch previously installed in --prefix.
         #[arg(long)]
         allow_downgrade: bool,
+        /// Reinstall even when --prefix already holds the resolved build.
+        #[arg(long)]
+        force: bool,
     },
     /// Re-hash an installed prefix against the SHA256SUMS written at install.
     Verify {
@@ -117,6 +120,7 @@ fn main() -> Result<()> {
             ignore_driver,
             allow_unverified,
             allow_downgrade,
+            force,
         } => {
             let plan = resolve::resolve(
                 &detect::machine(),
@@ -127,6 +131,7 @@ fn main() -> Result<()> {
             let opts = install::Options {
                 allow_unverified,
                 allow_downgrade,
+                force,
             };
             for w in &plan.warnings {
                 eprintln!("warning: {w}");

@@ -37,6 +37,7 @@ ovfetch detect                                   # NPU/GPU, driver, compiler, pl
 ovfetch resolve [--json]                         # what it would install, hashes checked, nothing downloaded
 sudo ovfetch install --prefix /usr/lib64/gaze    # download, verify, install
 ovfetch verify --prefix /usr/lib64/gaze          # re-hash an install against its SHA256SUMS
+# install skips the download when the prefix already holds the resolved build; --force reinstalls
 ```
 
 `--min-openvino 2026.2` overrides the floor. `--ignore-driver` lifts the ceiling, at your own risk.
