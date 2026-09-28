@@ -55,6 +55,7 @@ The mirrors catch a tampered CDN edge or a bad mirror, but they copy PyPI, so th
 Two scheduled workflows, so nobody maintains version tables by hand:
 
 - **Discover** (weekly) records new onnxruntime-openvino wheels, new NPU driver releases with their OpenVINO pairing and asset hashes, and new NPU PCI IDs from the kernel's `ivpu` driver. It opens a PR. Nothing reaches users until that PR is reviewed and a release is cut.
+- **Guard** (every PR) fails a PR from anyone but the owner that touches source, data, dependencies, or CI. It runs from main's copy, so a PR cannot edit it to pass, and only the owner can merge past it.
 - **Audit** (daily) re-checks every ledger hash against every source and spot-downloads a random few from a random mirror. Any change opens an issue.
 
 ## Installing
