@@ -10,9 +10,6 @@ pub const PYPI_SIMPLE: &[&str] = &[
     "https://pypi.org/simple",
     "https://pypi.tuna.tsinghua.edu.cn/simple",
     "https://mirrors.aliyun.com/pypi/simple",
-    "https://mirror.sjtu.edu.cn/pypi/web/simple",
-    "https://mirrors.cloud.tencent.com/pypi/simple",
-    "https://pypi.mirrors.ustc.edu.cn/simple",
 ];
 
 #[derive(Debug, Clone)]
@@ -23,6 +20,8 @@ pub struct PypiFile {
     pub url: String,
     pub size: u64,
     pub sha256: String,
+    /// `YYYY-MM-DD` of the upload to PyPI.
+    pub uploaded: String,
 }
 
 impl PypiFile {
@@ -58,6 +57,12 @@ pub fn pypi_wheels(project: &str) -> Result<Vec<PypiFile>> {
                     .as_str()
                     .unwrap_or_default()
                     .to_owned(),
+                uploaded: f["upload_time_iso_8601"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(10)
+                    .collect(),
             });
         }
     }
@@ -219,6 +224,7 @@ pub struct GithubAsset {
 #[derive(Debug, Clone)]
 pub struct GithubRelease {
     pub tag: String,
+    pub url: String,
     pub body: String,
     pub assets: Vec<GithubAsset>,
 }
@@ -239,6 +245,7 @@ pub fn github_releases(repo: &str) -> Result<Vec<GithubRelease>> {
             }
             out.push(GithubRelease {
                 tag: r["tag_name"].as_str().unwrap_or_default().to_owned(),
+                url: r["html_url"].as_str().unwrap_or_default().to_owned(),
                 body: r["body"].as_str().unwrap_or_default().to_owned(),
                 assets: r["assets"]
                     .as_array()
@@ -261,6 +268,21 @@ pub fn github_raw(repo: &str, git_ref: &str, path: &str) -> Result<String> {
     net::get_text(&format!(
         "https://raw.githubusercontent.com/{repo}/{git_ref}/{path}"
     ))
+}
+
+/// Filenames PyPI reports a PEP 740 provenance attestation for.
+pub fn pypi_provenance(project: &str) -> Result<Vec<String>> {
+    let json = net::get_json_accept(
+        &format!("https://pypi.org/simple/{project}/"),
+        "application/vnd.pypi.simple.v1+json",
+    )?;
+    Ok(json["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| !f["provenance"].is_null())
+        .filter_map(|f| f["filename"].as_str().map(str::to_owned))
+        .collect())
 }
 
 #[cfg(test)]
@@ -298,6 +320,7 @@ mod tests {
             url: String::new(),
             size: 0,
             sha256: String::new(),
+            uploaded: String::new(),
         };
         let wheels = [
             w("p-1.0-cp311-cp311-manylinux_2_28_x86_64.whl"),
