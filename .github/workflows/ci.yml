@@ -3,11 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
+  # discover.yml's bot-opened PRs run this in "awaiting approval" until a
+  # maintainer approves the run, which doubles as a review gate.
   pull_request:
-  # discover.yml opens PRs with GITHUB_TOKEN, which does not trigger
-  # pull_request runs. It dispatches this workflow on the PR branch instead, so
-  # the required checks still report on that head commit.
-  workflow_dispatch:
 
 permissions:
   contents: read
