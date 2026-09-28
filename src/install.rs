@@ -159,6 +159,9 @@ pub fn verify(prefix: &Path) -> Result<()> {
             Err(e) => bad.push(format!("{name}: {e}")),
         }
     }
+    for name in untracked(prefix, &sums)? {
+        bad.push(format!("{name}: not installed by ovfetch"));
+    }
     if !bad.is_empty() {
         bail!(
             "{} does not match its {SUMS}:\n  {}",
@@ -167,6 +170,43 @@ pub fn verify(prefix: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Entries in `prefix` that `sums` does not cover: anything other than a
+/// listed file, a symlink to one, or the sums and lock files themselves.
+fn untracked(prefix: &Path, sums: &str) -> Result<Vec<String>> {
+    let listed: Vec<&str> = sums
+        .lines()
+        .filter_map(|l| l.split_once("  "))
+        .map(|(_, n)| n)
+        .collect();
+    let mut out = Vec::new();
+    for e in fs::read_dir(prefix)?.flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        let owned = n == SUMS
+            || n == LOCK
+            || listed.contains(&n.as_str())
+            || (e.path().is_symlink()
+                && fs::canonicalize(e.path()).is_ok_and(|t| {
+                    t.parent() == fs::canonicalize(prefix).ok().as_deref()
+                        && t.file_name()
+                            .is_some_and(|f| listed.contains(&&*f.to_string_lossy()))
+                }));
+        if !owned {
+            out.push(n);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// What install clears from a prefix before copying the new build in.
+fn is_replaced(name: &str) -> bool {
+    name.starts_with("libonnxruntime")
+        || name.starts_with("libopenvino")
+        || name.starts_with("libtbb")
+        || name == SUMS
+        || name == LOCK
 }
 
 pub struct Options {
@@ -204,6 +244,21 @@ pub fn install(
             plan.artifact.id
         );
     }
+    if prefix.exists() {
+        let sums = fs::read_to_string(prefix.join(SUMS)).unwrap_or_default();
+        let foreign: Vec<String> = untracked(prefix, &sums)?
+            .into_iter()
+            .filter(|n| !is_replaced(n))
+            .collect();
+        if !foreign.is_empty() {
+            bail!(
+                "{} holds files ovfetch did not install and will not remove:\n  {}\n\
+                 Delete them, or pick an empty --prefix.",
+                prefix.display(),
+                foreign.join("\n  ")
+            );
+        }
+    }
     let tmp = TempDir::new()?;
     let lib = tmp.0.join("lib");
     fs::create_dir_all(&lib)?;
@@ -228,13 +283,7 @@ pub fn install(
 
     fs::create_dir_all(prefix).with_context(|| format!("creating {}", prefix.display()))?;
     for e in fs::read_dir(prefix)?.flatten() {
-        let n = e.file_name().to_string_lossy().into_owned();
-        if n.starts_with("libonnxruntime")
-            || n.starts_with("libopenvino")
-            || n.starts_with("libtbb")
-            || n == SUMS
-            || n == LOCK
-        {
+        if is_replaced(&e.file_name().to_string_lossy()) {
             fs::remove_file(e.path())?;
         }
     }
@@ -254,4 +303,35 @@ pub fn install(
         prefix.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_flags_files_it_did_not_write() {
+        let dir = TempDir::new().unwrap();
+        let p = &dir.0;
+        fs::write(p.join("libonnxruntime.so.1.23.0"), b"ort").unwrap();
+        symlink("libonnxruntime.so.1.23.0", p.join("libonnxruntime.so.1")).unwrap();
+        write_sums(p).unwrap();
+        fs::write(p.join(LOCK), "{}").unwrap();
+        verify(p).unwrap();
+
+        fs::write(
+            p.join("onnxruntime_pybind11_state.cpython-313-x86_64-linux-gnu.so"),
+            b"x",
+        )
+        .unwrap();
+        symlink("/etc/hostname", p.join("libstray.so")).unwrap();
+        let err = format!("{:#}", verify(p).unwrap_err());
+        assert!(
+            err.contains(
+                "onnxruntime_pybind11_state.cpython-313-x86_64-linux-gnu.so: not installed"
+            )
+        );
+        assert!(err.contains("libstray.so: not installed"));
+        assert!(!err.contains("libonnxruntime"));
+    }
 }
