@@ -4,9 +4,9 @@
 pci_id = "0xfd3e"
 kernel_name = "WCL"
 codename = "Wildcat Lake"
-min_openvino = "2026.2"
-min_npu_driver = "1.35.0"
-pinned_note = "Tested on a Dell XPS 13 (WCL): NPU compile_model fails with ZE_RESULT_ERROR_UNSUPPORTED_FEATURE on OpenVINO 2026.1/2026.2 with driver 1.32; works with 2026.2 + driver 1.35."
+min_openvino = "2025.4"
+min_npu_driver = "1.32.0"
+pinned_note = "OpenVINO floor measured 2026-09-27 on a Dell XPS 13 (WCL): Gaze's face models run on the NPU with OpenVINO 2025.4.1 (onnxruntime-openvino 1.24.1) and NPU driver 1.35.0, 0 ms NPU busy at idle vs 16 ms per face unlock. Driver floor is Intel's: 1.32.0 is the first NPU driver release verified on Wildcat Lake."
 
 [[platform]]
 pci_id = "0x7d1d"
