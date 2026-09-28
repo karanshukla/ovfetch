@@ -284,6 +284,8 @@ pub fn discover(data: &mut Data) -> Result<String> {
                 version: version.to_string(),
                 openvino: openvino.to_string(),
                 platforms,
+                measured_openvino: None,
+                measured_note: None,
             });
         }
         for a in &r.assets {

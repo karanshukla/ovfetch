@@ -79,6 +79,8 @@ platforms = ["Meteor Lake", "Arrow Lake", "Lunar Lake", "Panther Lake"]
 version = "1.32.0"
 openvino = "2026.0"
 platforms = ["Meteor Lake", "Arrow Lake", "Lunar Lake", "Panther Lake", "Wildcat Lake"]
+measured_openvino = "2026.4"
+measured_note = "Measured 2026-09-28 on a Dell XPS 13 (WCL), Intel's 1.32.0 release with its own libnpu_driver_compiler.so: OpenVINO 2025.0 through 2026.4.0 each compiled and ran a model on the NPU from an empty driver cache, and 2026.4.0 ran whisper-small.en's static pipeline (49 s compile, correct decodes). Fedora's 1.32.0 rpm ships no compiler and fails every version with ZE_RESULT_ERROR_UNSUPPORTED_FEATURE."
 
 [[driver]]
 version = "1.32.1"
@@ -94,6 +96,8 @@ platforms = ["Meteor Lake", "Arrow Lake", "Lunar Lake", "Panther Lake", "Wildcat
 version = "1.35.0"
 openvino = "2026.2"
 platforms = ["Meteor Lake", "Arrow Lake", "Lunar Lake", "Panther Lake", "Wildcat Lake"]
+measured_openvino = "2026.4"
+measured_note = "Measured 2026-09-28 on a Dell XPS 13 (WCL) with driver 1.35.0 and its compiler: OpenVINO 2025.0 through 2026.4.0 each compiled and ran a model on the NPU from an empty driver cache, and 2026.4.0 ran whisper-small.en's static pipeline (41 s compile, correct decodes)."
 
 [[driver]]
 version = "1.38.0"

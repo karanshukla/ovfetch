@@ -5,13 +5,13 @@ Tell it "install the OpenVINO build this machine's Intel NPU needs" and it works
 ```
 $ ovfetch resolve --min-openvino 2025.1
 floor:    2025.1 (--min-openvino)
-ceiling:  2026.2 (newest the installed NPU driver pairs with)
+ceiling:  2026.4 (newest known to compile on the installed NPU driver)
 openvino: 2025.4.1 (onnxruntime-openvino 1.24.1, Verified)
 download: https://files.pythonhosted.org/packages/.../onnxruntime_openvino-1.24.1-cp313-cp313-manylinux_2_28_x86_64.whl
 sha256:   2c3bb73e68ac27f4891af8a595c1faf574ec68b772e6583c90a0b997a1822782
 ```
 
-It exists because two of my projects ([Gaze](https://github.com/GunduLabs/gaze) and [vinoWhisper](https://github.com/karanshukla/vinoWhisper)) need ONNX Runtime with the OpenVINO execution provider, and the answer to "which version" depends on the NPU, its driver, and what Intel has actually published. Working that out by hand every time is the job this replaces, for people and for AI agents alike (`resolve --json` is the API).
+It exists because [Gaze](https://github.com/GunduLabs/gaze) needs ONNX Runtime with the OpenVINO execution provider, and the answer to "which version" depends on the NPU, its driver, and what Intel has actually published. Working that out by hand every time is the job this replaces, for people and for AI agents alike (`resolve --json` is the API).
 
 ## What it picks
 
@@ -20,9 +20,11 @@ Two bounds, and the newest prebuilt build between them:
 | Bound | Where it comes from |
 |---|---|
 | **Floor** | The NPU's PCI ID, mapped to the first Intel NPU driver release verified on that platform and the OpenVINO it paired with. A human-tested floor can be pinned over it. |
-| **Ceiling** | The installed NPU driver. Each driver release pairs with one OpenVINO; a newer OpenVINO than that fails to compile models on the NPU (`ZE_RESULT_ERROR_UNSUPPORTED_FEATURE`), an older one keeps working. |
+| **Ceiling** | The installed NPU driver: the newest OpenVINO known to work with it, which is Intel's pairing for that release unless a newer one has been measured. Past it is untested rather than known to fail, and ovfetch stays below it anyway. |
 
 No NPU, no bounds: the newest build wins.
+
+Both bounds are deliberately pessimistic. Measured 2026-09-28 on Wildcat Lake, drivers 1.32.0 and 1.35.0 each compiled and ran a small test model on every OpenVINO from 2025.0 to 2026.4, and whisper-small.en's full pipeline on 2026.4, so neither bound has been seen to fail; the older versions were not tried with a real model. What did fail was a driver without its compiler: Fedora's 1.32.0 rpm ships none, and every `compile_model` then returns `ZE_RESULT_ERROR_UNSUPPORTED_FEATURE`, which looks like a version mismatch and is not one. `detect` checks for the compiler library the installed driver actually loads, since the name changed between 1.32 and 1.35.
 
 **It never compiles anything.** If no prebuilt build fits, it stops and says which bound is in the way. An NPU that is newer than the data (no known floor) is refused too, rather than guessed at.
 
@@ -31,7 +33,7 @@ It installs into its own prefix and never touches the distro's OpenVINO, driver,
 ## Usage
 
 ```bash
-ovfetch detect                                   # NPU/GPU, NPU driver, compiler
+ovfetch detect                                   # NPU/GPU, driver, compiler, platform bounds; offline
 ovfetch resolve [--json]                         # what it would install, hashes checked, nothing downloaded
 sudo ovfetch install --prefix /usr/lib64/gaze    # download, verify, install
 ovfetch verify --prefix /usr/lib64/gaze          # re-hash an install against its SHA256SUMS
