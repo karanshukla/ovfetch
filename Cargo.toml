@@ -9,6 +9,8 @@ repository = "https://github.com/karanshukla/ovfetch"
 readme = "README.md"
 keywords = ["openvino", "onnxruntime", "npu", "intel", "supply-chain"]
 categories = ["command-line-utilities"]
+# The data files are compiled in, so they ship; CI config and tooling do not.
+include = ["src/**", "data/**", "Cargo.toml", "Cargo.lock", "README.md", "SECURITY.md", "LICENSE-MIT"]
 
 [dependencies]
 anyhow = "1.0.104"
