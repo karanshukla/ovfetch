@@ -32,35 +32,80 @@ pub fn check_url(url: &str) -> Result<()> {
     Ok(())
 }
 
-fn call(req: ureq::Request) -> Result<ureq::Response> {
-    let url = req.url().to_owned();
-    check_url(&url)?;
-    let resp = req.call().with_context(|| format!("GET {url}"))?;
-    check_url(resp.get_url()).with_context(|| format!("{url} redirected"))?;
-    Ok(resp)
-}
+const MAX_REDIRECTS: usize = 5;
+/// Cap on API and index pages held in memory; the largest (a mirror's
+/// simple-index page) is under 1 MiB.
+const MAX_PAGE: u64 = 64 << 20;
 
 fn agent() -> ureq::Agent {
     // TLS is rustls with Mozilla's roots compiled in, so a spoofed DNS answer
     // still has to present a valid certificate for the allowed host.
-    ureq::AgentBuilder::new()
+    // Redirects are followed by hand so every hop is checked before any
+    // connection to it is made.
+    ureq::Agent::config_builder()
         .https_only(true)
-        .timeout_connect(Duration::from_secs(10))
-        .timeout_read(Duration::from_secs(60))
+        .max_redirects(0)
+        .max_redirects_will_error(false)
+        .http_status_as_error(false)
+        .timeout_connect(Some(Duration::from_secs(10)))
+        .timeout_recv_response(Some(Duration::from_secs(60)))
         .user_agent(concat!("ovfetch/", env!("CARGO_PKG_VERSION")))
         .build()
+        .into()
+}
+
+/// GET with the allowlist enforced on the URL and on every redirect target.
+fn get(url: &str, headers: &[(&str, &str)]) -> Result<ureq::http::Response<ureq::Body>> {
+    let agent = agent();
+    let mut url = url.to_owned();
+    for _ in 0..=MAX_REDIRECTS {
+        check_url(&url)?;
+        let mut req = agent.get(&url);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let resp = req.call().with_context(|| format!("GET {url}"))?;
+        let status = resp.status();
+        if status.is_redirection() {
+            let location = resp
+                .headers()
+                .get("location")
+                .and_then(|l| l.to_str().ok())
+                .with_context(|| format!("{url} redirected without a Location"))?;
+            url = resolve_location(&url, location);
+            continue;
+        }
+        if !status.is_success() {
+            bail!("GET {url}: HTTP {status}");
+        }
+        return Ok(resp);
+    }
+    bail!("more than {MAX_REDIRECTS} redirects from {url}")
+}
+
+/// Absolute, scheme-relative (`//host/x`), or path-absolute (`/x`) Location.
+fn resolve_location(from: &str, location: &str) -> String {
+    if location.contains("://") {
+        return location.to_owned();
+    }
+    if let Some(rest) = location.strip_prefix("//") {
+        return format!("https://{rest}");
+    }
+    let origin: String = from.splitn(4, '/').take(3).collect::<Vec<_>>().join("/");
+    format!("{origin}/{}", location.trim_start_matches('/'))
 }
 
 pub fn get_text(url: &str) -> Result<String> {
-    let mut req = agent().get(url);
-    if let (true, Ok(token)) = (
-        url.starts_with("https://api.github.com/"),
-        std::env::var("GITHUB_TOKEN"),
-    ) {
-        req = req.set("Authorization", &format!("Bearer {token}"));
-    }
-    call(req)?
-        .into_string()
+    let token = std::env::var("GITHUB_TOKEN")
+        .ok()
+        .filter(|_| url.starts_with("https://api.github.com/"));
+    let auth = token.map(|t| format!("Bearer {t}"));
+    let headers: Vec<(&str, &str)> = auth.iter().map(|a| ("Authorization", a.as_str())).collect();
+    get(url, &headers)?
+        .body_mut()
+        .with_config()
+        .limit(MAX_PAGE)
+        .read_to_string()
         .with_context(|| format!("reading {url}"))
 }
 
@@ -75,8 +120,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// Streams `url` to `dest`, hashing as it goes. Returns the hex sha256.
 pub fn download(url: &str, dest: &Path) -> Result<String> {
     eprintln!("downloading {url}");
-    let resp = call(agent().get(url))?;
-    let mut reader = resp.into_reader();
+    let mut reader = get(url, &[])?.into_body().into_reader();
     let mut file = std::fs::File::create(dest)?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1 << 16];
@@ -116,7 +160,7 @@ impl Read for RangeReader {
             return Ok(0);
         }
         let range = format!("bytes={}-{}", self.pos, self.pos + n - 1);
-        let resp = call(agent().get(&self.url).set("Range", &range)).map_err(io::Error::other)?;
+        let resp = get(&self.url, &[("Range", &range)]).map_err(io::Error::other)?;
         if resp.status() != 206 {
             return Err(io::Error::other(format!(
                 "{} ignored the range request",
@@ -124,7 +168,10 @@ impl Read for RangeReader {
             )));
         }
         let mut data = Vec::with_capacity(n as usize);
-        resp.into_reader().take(n).read_to_end(&mut data)?;
+        resp.into_body()
+            .into_reader()
+            .take(n)
+            .read_to_end(&mut data)?;
         buf[..data.len()].copy_from_slice(&data);
         self.pos += data.len() as u64;
         Ok(data.len())
@@ -164,5 +211,18 @@ mod tests {
         assert!(check_url("https://files.pythonhosted.org.evil.example/x.whl").is_err());
         assert!(check_url("https://pypi.org@evil.example/x.whl").is_err());
         assert!(check_url("https://pypi.org:8443/x.whl").is_err());
+    }
+
+    #[test]
+    fn redirect_locations_resolve_before_the_allowlist_check() {
+        use super::resolve_location;
+        let from = "https://pypi.org/simple/p/";
+        assert_eq!(resolve_location(from, "/x"), "https://pypi.org/x");
+        assert_eq!(
+            resolve_location(from, "//evil.example/x"),
+            "https://evil.example/x"
+        );
+        assert!(check_url(&resolve_location(from, "//evil.example/x")).is_err());
+        assert!(check_url(&resolve_location(from, "http://pypi.org/x")).is_err());
     }
 }

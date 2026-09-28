@@ -1,0 +1,92 @@
+name: Guard
+
+# Fails any PR from someone other than the owner that touches what ovfetch
+# trusts: source code (hosts, mirrors, hash agreement, install), the compiled-in
+# data, dependencies, CI, or security policy. `guard` is a required check, so
+# such a PR can only merge through the owner's ruleset bypass.
+#
+# pull_request_target runs THIS file from main, never the PR's copy, so a PR
+# cannot edit the guard to pass itself. That trigger is only safe because
+# nothing from the PR is checked out or executed: the changed files and the
+# ledger diff are read through the API as data.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions: {}
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check who is changing what
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          OWNER: karanshukla
+        run: |
+          set -euo pipefail
+          if [ "$AUTHOR" = "$OWNER" ]; then
+            echo "PR by $OWNER; nothing to guard."
+            exit 0
+          fi
+
+          gh api --paginate "repos/$REPO/pulls/$PR/files" \
+            --jq '.[] | [.filename, .status, (.previous_filename // "")] | @tsv' > files.tsv
+
+          # Discover PRs (opened by this repo's own workflow on main) may add
+          # releases to the ledger and update derived floors, but never edit or
+          # remove a recorded hash.
+          discover_ok() {
+            [ "$AUTHOR" = "github-actions[bot]" ] || return 1
+            local name="$1" status="$2"
+            case "$name" in
+              data/platforms.toml | data/npu_drivers.toml) [ "$status" = modified ] ;;
+              data/ledger.toml)
+                [ "$status" = modified ] || return 1
+                gh api "repos/$REPO/pulls/$PR/files" --paginate \
+                  --jq '.[] | select(.filename == "data/ledger.toml") | .patch' \
+                  | grep -E '^-[^-]' && return 1
+                return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          sensitive() {
+            case "$1" in
+              src/* | data/* | .github/* | Cargo.toml | Cargo.lock | deny.toml | build.rs | SECURITY.md) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          flagged=()
+          while IFS=$'\t' read -r name status previous; do
+            # A rename is judged on both ends, so moving a protected file out of
+            # a protected path does not slip through.
+            for path in "$name" "$previous"; do
+              [ -n "$path" ] || continue
+              if sensitive "$path" && ! discover_ok "$path" "$status"; then
+                flagged+=("$path ($status)")
+              fi
+            done
+          done < files.tsv
+
+          if [ ${#flagged[@]} -eq 0 ]; then
+            echo "No protected paths touched by $AUTHOR."
+            exit 0
+          fi
+          {
+            echo "## Guard: $OWNER must merge this"
+            echo
+            echo "\`$AUTHOR\` changed paths that control what ovfetch trusts:"
+            echo
+            printf -- '- `%s`\n' "${flagged[@]}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          printf '::error::%s changed protected path %s\n' "$AUTHOR" "${flagged[@]}"
+          exit 1

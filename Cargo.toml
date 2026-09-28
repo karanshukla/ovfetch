@@ -1,6 +1,6 @@
 [package]
 name = "ovfetch"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Resolve, download, and hash-verify the OpenVINO-enabled ONNX Runtime an Intel NPU needs"
@@ -20,7 +20,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"
 toml = "1.1.6"
-ureq = "2"
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [profile.release]
