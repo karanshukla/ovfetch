@@ -41,7 +41,7 @@ ovfetch verify --prefix /usr/lib64/gaze          # re-hash an install against it
 
 ## How it decides a hash is trustworthy
 
-1. **PyPI plus five independent mirrors** each state the wheel's sha256. At least two must answer, and every one that answers must agree. One disagreement aborts the install and prints every source's claim.
+1. **PyPI plus two independent mirrors** each state the wheel's sha256. At least two must answer, and every one that answers must agree. One disagreement aborts the install and prints every source's claim.
 2. **The ledger** (`data/ledger.toml`) records the hash of every artifact the first time it was seen, and is compiled into the binary. A published file's hash must never change, so a mismatch aborts even when every source agrees.
 3. **The bytes** come from pypi.org, falling back to a mirror only if PyPI is unreachable, and are hashed as they stream. They must match the agreed hash.
 4. **The network** is HTTPS-only to a fixed list of hosts, re-checked after redirects. TLS roots are compiled in (rustls), so a spoofed DNS answer still needs a valid certificate for the real host.
@@ -54,7 +54,7 @@ The mirrors catch a tampered CDN edge or a bad mirror, but they copy PyPI, so th
 
 Two scheduled workflows, so nobody maintains version tables by hand:
 
-- **Discover** (weekly) records new onnxruntime-openvino wheels, new NPU driver releases with their OpenVINO pairing and asset hashes, and new NPU PCI IDs from the kernel's `ivpu` driver. It opens a PR. Nothing reaches users until that PR is reviewed and a release is cut.
+- **Discover** (weekly) records new onnxruntime-openvino wheels once they have been public for 7 days, each linked to Intel's matching intel/onnxruntime release so review means checking it lines up with a real release. It also flags the day PyPI starts publishing provenance for them. new NPU driver releases with their OpenVINO pairing and asset hashes, and new NPU PCI IDs from the kernel's `ivpu` driver. It opens a PR. Nothing reaches users until that PR is reviewed and a release is cut.
 - **Guard** (every PR) fails a PR from anyone but the owner that touches source, data, dependencies, or CI. It runs from main's copy, so a PR cannot edit it to pass, and only the owner can merge past it.
 - **Audit** (daily) re-checks every ledger hash against every source and spot-downloads a random few from a random mirror. Any change opens an issue.
 

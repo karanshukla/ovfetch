@@ -147,6 +147,7 @@ fn main() -> Result<()> {
                     url: String::new(),
                     size: 0,
                     sha256: String::new(),
+                    uploaded: String::new(),
                 };
                 let urls = sources::pypi_download_urls(&file, &sources::mirror_pages(project));
                 urls.into_iter().filter(|u| !u.is_empty()).collect()

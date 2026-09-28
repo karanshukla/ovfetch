@@ -78,6 +78,7 @@ mod tests {
                 id: "x".into(),
                 digest: digest.into(),
                 first_seen: "2026-09-27".into(),
+                provenance: false,
             }],
         }
     }

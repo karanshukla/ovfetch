@@ -12,9 +12,6 @@ const ALLOWED_HOSTS: &[&str] = &[
     "files.pythonhosted.org",
     "pypi.tuna.tsinghua.edu.cn",
     "mirrors.aliyun.com",
-    "mirror.sjtu.edu.cn",
-    "mirrors.cloud.tencent.com",
-    "pypi.mirrors.ustc.edu.cn",
     "api.github.com",
     "raw.githubusercontent.com",
 ];
@@ -93,6 +90,16 @@ fn resolve_location(from: &str, location: &str) -> String {
     }
     let origin: String = from.splitn(4, '/').take(3).collect::<Vec<_>>().join("/");
     format!("{origin}/{}", location.trim_start_matches('/'))
+}
+
+pub fn get_json_accept(url: &str, accept: &str) -> Result<serde_json::Value> {
+    let text = get(url, &[("Accept", accept)])?
+        .body_mut()
+        .with_config()
+        .limit(MAX_PAGE)
+        .read_to_string()
+        .with_context(|| format!("reading {url}"))?;
+    serde_json::from_str(&text).with_context(|| format!("parsing JSON from {url}"))
 }
 
 pub fn get_text(url: &str) -> Result<String> {

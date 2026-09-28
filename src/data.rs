@@ -60,6 +60,9 @@ pub struct Entry {
     /// sha256 of the file.
     pub digest: String,
     pub first_seen: String,
+    /// PyPI reported a PEP 740 provenance attestation for this file.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub provenance: bool,
 }
 
 impl Ledger {

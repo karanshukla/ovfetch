@@ -128,9 +128,18 @@ pub fn audit(data: &Data, sample: usize) -> Result<String> {
     bail!(report)
 }
 
+/// A release only enters the ledger after this long in public, so a
+/// malicious upload has time to be noticed and pulled first.
+const COOLDOWN_DAYS: u32 = 7;
+const INTEL_ORT_REPO: &str = "intel/onnxruntime";
+
 fn today() -> String {
+    date_ago(0)
+}
+
+fn date_ago(days: u32) -> String {
     std::process::Command::new("date")
-        .args(["-u", "+%F"])
+        .args(["-u", "-d", &format!("{days} days ago"), "+%F"])
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
@@ -145,6 +154,7 @@ fn record(data: &mut Data, id: String, digest: String, changes: &mut Vec<String>
             id,
             digest,
             first_seen: today(),
+            provenance: false,
         });
     }
 }
@@ -203,19 +213,53 @@ fn parse_driver_notes(body: &str) -> (Vec<String>, Option<Ver>) {
 pub fn discover(data: &mut Data) -> Result<String> {
     let mut changes = Vec::new();
 
+    let cutoff = date_ago(COOLDOWN_DAYS);
+    let intel = sources::github_releases(INTEL_ORT_REPO)?;
+    let mut held = Vec::new();
     for (project, min) in TRACKED {
         let pages = sources::mirror_pages(project);
+        let attested = sources::pypi_provenance(project)?;
         for w in tracked_wheels(project, min)? {
-            if data.ledger.get(&w.ledger_id()).is_some() {
+            let id = w.ledger_id();
+            let has_provenance = attested.contains(&w.filename);
+            if let Some(e) = data.ledger.list.iter_mut().find(|e| e.id == id) {
+                if has_provenance && !e.provenance {
+                    e.provenance = true;
+                    changes.push(format!(
+                        "- **PyPI now publishes provenance for `{id}`.** ovfetch does not verify it yet; that is the next thing to build."
+                    ));
+                }
+                continue;
+            }
+            if w.uploaded.as_str() > cutoff.as_str() {
+                held.push(format!(
+                    "- `{id}` (uploaded {}), recorded once it is {COOLDOWN_DAYS} days old",
+                    w.uploaded
+                ));
                 continue;
             }
             // A new release still has to clear the same agreement bar as an install.
-            let (digest, _) = consensus::agree(
-                &w.ledger_id(),
-                &sources::pypi_claims(&w, &pages),
-                &data.ledger,
-            )?;
-            record(data, w.ledger_id(), digest, &mut changes);
+            let (digest, _) =
+                consensus::agree(&id, &sources::pypi_claims(&w, &pages), &data.ledger)?;
+            let needle = format!("onnxruntime {}", w.version);
+            let release = intel
+                .iter()
+                .find(|r| r.body.to_lowercase().contains(&needle));
+            changes.push(format!(
+                "- ledger: `{id}` = `{digest}`, uploaded {}, {}{}",
+                w.uploaded,
+                match release {
+                    Some(r) => format!("Intel release [{}]({})", r.tag, r.url),
+                    None => format!("**no {INTEL_ORT_REPO} release mentions ONNX Runtime {}; check before merging**", w.version),
+                },
+                if has_provenance { ", PyPI provenance published" } else { "" }
+            ));
+            data.ledger.list.push(Entry {
+                id,
+                digest,
+                first_seen: today(),
+                provenance: has_provenance,
+            });
         }
     }
 
@@ -318,6 +362,10 @@ pub fn discover(data: &mut Data) -> Result<String> {
         }
     }
 
+    if !changes.is_empty() && !held.is_empty() {
+        changes.push(format!("\nHeld back by the {COOLDOWN_DAYS}-day cooldown:"));
+        changes.extend(held);
+    }
     Ok(changes.join("\n"))
 }
 
