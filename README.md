@@ -11,7 +11,7 @@ download: https://files.pythonhosted.org/packages/.../onnxruntime_openvino-1.24.
 sha256:   2c3bb73e68ac27f4891af8a595c1faf574ec68b772e6583c90a0b997a1822782
 ```
 
-It exists because [Gaze](https://github.com/GunduLabs/gaze) needs ONNX Runtime with the OpenVINO execution provider, and the answer to "which version" depends on the NPU, its driver, and what Intel has actually published. Working that out by hand every time is the job this replaces, for people and for AI agents alike (`resolve --json` is the API).
+It exists because [vinoAuthFace](https://github.com/karanshukla/vinoAuthFace) needs ONNX Runtime with the OpenVINO execution provider, and the answer to "which version" depends on the NPU, its driver, and what Intel has actually published. Working that out by hand every time is the job this replaces, for people and for AI agents alike (`resolve --json` is the API).
 
 ## What it picks
 
@@ -35,8 +35,8 @@ It installs into its own prefix and never touches the distro's OpenVINO, driver,
 ```bash
 ovfetch detect                                   # NPU/GPU, driver, compiler, platform bounds; offline
 ovfetch resolve [--json]                         # what it would install, hashes checked, nothing downloaded
-sudo ovfetch install --prefix /usr/lib64/gaze    # download, verify, install
-ovfetch verify --prefix /usr/lib64/gaze          # re-hash an install against its SHA256SUMS
+sudo ovfetch install --prefix /usr/local/lib/face-auth/openvino    # download, verify, install
+ovfetch verify --prefix /usr/local/lib/face-auth/openvino          # re-hash an install against its SHA256SUMS
 # install skips the download when the prefix already holds the resolved build; --force reinstalls
 ```
 
@@ -67,8 +67,6 @@ let machine = ovfetch::detect::machine();
 let status = ovfetch::status::status(&machine, &data);
 // status.warnings: missing NPU driver or compiler, a driver older than the platform needs, an NPU the data does not know
 ```
-
-Gaze uses this for a `gaze doctor` check.
 
 ## Keeping the data current
 

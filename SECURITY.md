@@ -1,6 +1,6 @@
 # Security
 
-ovfetch downloads native libraries that other programs then load, often as root (Gaze's `gazed`, PAM modules). A compromise here is a compromise of everything downstream, so the bar is higher than for a normal CLI.
+ovfetch downloads native libraries that other programs then load, often as root (PAM modules such as vinoAuthFace's `face-auth`). A compromise here is a compromise of everything downstream, so the bar is higher than for a normal CLI.
 
 ## Reporting
 
