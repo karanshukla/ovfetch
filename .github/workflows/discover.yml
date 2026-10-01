@@ -20,6 +20,8 @@ jobs:
       pull-requests: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --locked --release
@@ -41,7 +43,9 @@ jobs:
           git switch -c "$branch"
           git add data
           git commit -m "data: record upstream releases found $(date -u +%F)"
-          git push --force-with-lease origin "$branch"
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c http.https://github.com/.extraheader="AUTHORIZATION: basic $auth" \
+            push --force-with-lease origin "$branch"
           {
             echo "Found by \`ovfetch ci discover\`. Review before merging: everything here ships in the next release's compiled-in ledger."
             echo
