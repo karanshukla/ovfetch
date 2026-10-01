@@ -19,20 +19,26 @@ const ALLOWED_HOSTS: &[&str] = &[
 /// Rejects anything but `https://<allowed host>/...`: no plain HTTP, no
 /// userinfo, no explicit port, no host outside the list.
 pub fn check_url(url: &str) -> Result<()> {
-    let rest = url
-        .strip_prefix("https://")
+    url.strip_prefix("https://")
         .with_context(|| format!("refusing non-HTTPS URL {url}"))?;
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let authority = authority(url);
     if authority.contains(['@', ':']) || !ALLOWED_HOSTS.contains(&authority) {
         bail!("refusing {url}: {authority} is not an allowed host");
     }
     Ok(())
 }
 
+fn authority(url: &str) -> &str {
+    let rest = url.strip_prefix("https://").unwrap_or(url);
+    rest.split(['/', '?', '#']).next().unwrap_or_default()
+}
+
 const MAX_REDIRECTS: usize = 5;
 /// Cap on API and index pages held in memory; the largest (a mirror's
 /// simple-index page) is under 1 MiB.
 const MAX_PAGE: u64 = 64 << 20;
+/// Cap on a downloaded file; the largest onnxruntime-openvino wheel is ~80 MiB.
+const MAX_DOWNLOAD: u64 = 512 << 20;
 
 fn agent() -> ureq::Agent {
     // TLS is rustls with Mozilla's roots compiled in, so a spoofed DNS answer
@@ -52,14 +58,19 @@ fn agent() -> ureq::Agent {
 }
 
 /// GET with the allowlist enforced on the URL and on every redirect target.
+/// `Authorization` is only sent to the host it was meant for.
 fn get(url: &str, headers: &[(&str, &str)]) -> Result<ureq::http::Response<ureq::Body>> {
     let agent = agent();
+    let host = authority(url).to_owned();
     let mut url = url.to_owned();
     for _ in 0..=MAX_REDIRECTS {
         check_url(&url)?;
+        let same_host = authority(&url) == host;
         let mut req = agent.get(&url);
         for (k, v) in headers {
-            req = req.header(*k, *v);
+            if same_host || !k.eq_ignore_ascii_case("authorization") {
+                req = req.header(*k, *v);
+            }
         }
         let resp = req.call().with_context(|| format!("GET {url}"))?;
         let status = resp.status();
@@ -127,7 +138,11 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// Streams `url` to `dest`, hashing as it goes. Returns the hex sha256.
 pub fn download(url: &str, dest: &Path) -> Result<String> {
     eprintln!("downloading {url}");
-    let mut reader = get(url, &[])?.into_body().into_reader();
+    let mut reader = get(url, &[])?
+        .into_body()
+        .into_with_config()
+        .limit(MAX_DOWNLOAD)
+        .reader();
     let mut file = std::fs::File::create(dest)?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1 << 16];

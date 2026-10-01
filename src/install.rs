@@ -133,6 +133,9 @@ fn normalise_links(lib: &Path) -> Result<()> {
             continue;
         }
         if let Some(soname) = soname(&fs::read(&path)?) {
+            if soname.contains('/') || soname == ".." {
+                bail!("{} has an invalid soname {soname:?}", path.display());
+            }
             let link = lib.join(&soname);
             if soname != entry.file_name().to_string_lossy() && link.symlink_metadata().is_err() {
                 symlink(entry.file_name(), link)?;
