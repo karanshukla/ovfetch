@@ -44,7 +44,7 @@ ovfetch verify --prefix /usr/local/lib/face-auth/openvino          # re-hash an 
 
 ## How it decides a hash is trustworthy
 
-1. **PyPI plus two independent mirrors** each state the wheel's sha256. At least two must answer, and every one that answers must agree. One disagreement aborts the install and prints every source's claim.
+1. **PyPI plus two independent mirrors** each state the wheel's sha256. At least two different hosts must answer, so pypi.org alone is never enough, and every one that answers must agree. One disagreement aborts the install and prints every source's claim.
 2. **The ledger** (`data/ledger.toml`) records the hash of every artifact the first time it was seen, and is compiled into the binary. A published file's hash must never change, so a mismatch aborts even when every source agrees.
 3. **The bytes** come from pypi.org, falling back to a mirror only if PyPI is unreachable, and are hashed as they stream. They must match the agreed hash.
 4. **The network** is HTTPS-only to a fixed list of hosts, re-checked after redirects. TLS roots are compiled in (rustls), so a spoofed DNS answer still needs a valid certificate for the real host.

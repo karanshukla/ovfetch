@@ -3,6 +3,7 @@
 use crate::data::Ledger;
 use crate::sources::Claim;
 use anyhow::{Result, bail};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -13,8 +14,14 @@ pub enum Trust {
     Unverified,
 }
 
-/// Minimum sources that must answer, so one reachable host cannot vouch for itself.
+/// Minimum distinct hosts that must answer, so one reachable host cannot vouch for itself.
 pub const QUORUM: usize = 2;
+
+/// `pypi.org` for both `pypi.org/pypi JSON` and `https://pypi.org/simple`.
+fn host(source: &str) -> &str {
+    let rest = source.strip_prefix("https://").unwrap_or(source);
+    rest.split('/').next().unwrap_or(rest)
+}
 
 /// The agreed digest, or an error naming every source when any disagree.
 pub fn agree(id: &str, claims: &[Claim], ledger: &Ledger) -> Result<(String, Trust)> {
@@ -26,10 +33,11 @@ pub fn agree(id: &str, claims: &[Claim], ledger: &Ledger) -> Result<(String, Tru
             c.error.as_deref().unwrap_or_default()
         );
     }
-    if answered.len() < QUORUM {
+    let hosts: HashSet<&str> = answered.iter().map(|c| host(&c.source)).collect();
+    if hosts.len() < QUORUM {
         bail!(
-            "only {} source(s) answered for {id}, need {QUORUM}; refusing to trust a single host",
-            answered.len()
+            "only {} host(s) answered for {id}, need {QUORUM}; refusing to trust a single host",
+            hosts.len()
         );
     }
     let first = answered[0].digest.clone().unwrap_or_default();
@@ -134,6 +142,16 @@ mod tests {
     #[test]
     fn a_single_reachable_source_is_not_enough() {
         let claims = [claim("a", Some("aa")), claim("b", None)];
+        assert!(agree("x", &claims, &Ledger::default()).is_err());
+    }
+
+    #[test]
+    fn two_answers_from_one_host_are_not_enough() {
+        let claims = [
+            claim("pypi.org/pypi JSON", Some("aa")),
+            claim("https://pypi.org/simple", Some("aa")),
+            claim("https://mirrors.aliyun.com/pypi/simple", None),
+        ];
         assert!(agree("x", &claims, &Ledger::default()).is_err());
     }
 }
