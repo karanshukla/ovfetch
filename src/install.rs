@@ -6,8 +6,9 @@ use crate::resolve::Plan;
 use crate::version::Ver;
 use anyhow::{Context, Result, bail};
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{DirBuilderExt, symlink};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const SUMS: &str = "SHA256SUMS";
 const LOCK: &str = "ovfetch.lock.json";
@@ -15,9 +16,16 @@ const LOCK: &str = "ovfetch.lock.json";
 struct TempDir(PathBuf);
 
 impl TempDir {
+    /// A new directory only the current user can enter. Install runs as root
+    /// and copies what lands here into the prefix, so a path someone else
+    /// created first in /tmp is an error, not something to reuse.
     fn new() -> Result<Self> {
-        let p = std::env::temp_dir().join(format!("ovfetch-{}", std::process::id()));
-        fs::create_dir_all(&p)?;
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.subsec_nanos();
+        let p = std::env::temp_dir().join(format!("ovfetch-{}-{nanos}", std::process::id()));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&p)
+            .with_context(|| format!("creating {}", p.display()))?;
         Ok(Self(p))
     }
 }
@@ -382,6 +390,14 @@ mod tests {
         };
         assert_eq!(soname(&libc).as_deref(), Some("libc.so.6"));
         assert_eq!(soname(b"not elf"), None);
+    }
+
+    #[test]
+    fn temp_dir_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let mode = fs::metadata(&dir.0).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 
     #[test]
