@@ -8,10 +8,11 @@
 //! `cmake/deps.txt`.
 
 use crate::install::{self, Options};
+use crate::net;
 use crate::resolve::{BuildPlan, Plan};
 use anyhow::{Context, Result, bail};
 use std::fs;
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -61,8 +62,51 @@ fn run(cmd: &mut Command) -> Result<()> {
     Ok(())
 }
 
+/// Effective uid, from procfs since std has no geteuid.
+fn euid() -> Result<u32> {
+    let status = fs::read_to_string("/proc/self/status")?;
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Uid:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|u| u.parse().ok())
+        .context("no effective uid in /proc/self/status")
+}
+
+/// Whatever is in the build tree gets executed and installed, so it must be
+/// writable by nobody but the user running ovfetch. DirBuilder's mode only
+/// applies to directories it creates, so an existing one is checked here.
+fn ensure_private(dir: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(dir).with_context(|| format!("reading {}", dir.display()))?;
+    let me = euid()?;
+    if !meta.is_dir() || meta.uid() != me || meta.mode() & 0o022 != 0 {
+        bail!(
+            "{} must be a directory owned by uid {me} and writable by no one else \
+             (it is uid {}, mode {:o}). Its contents are compiled and installed, so ovfetch will not build there; \
+             pass another --build-dir or delete it.",
+            dir.display(),
+            meta.uid(),
+            meta.mode() & 0o7777
+        );
+    }
+    Ok(())
+}
+
 fn git(src: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git").arg("-C").arg(src).args(args).output()?;
+    let out = Command::new("git")
+        // Only the pinned tree's content counts, never config that could run a command.
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
+        .arg("-C")
+        .arg(src)
+        .args(args)
+        .output()?;
     if !out.status.success() {
         bail!(
             "git {} failed: {}",
@@ -79,6 +123,8 @@ fn source(recipe: &BuildPlan, src: &Path) -> Result<()> {
     if !src.exists() {
         run(Command::new("git")
             .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .args([
                 "clone",
                 "--depth",
@@ -99,7 +145,15 @@ fn source(recipe: &BuildPlan, src: &Path) -> Result<()> {
             recipe.git_commit
         );
     }
-    let dirty = git(src, &["status", "--porcelain", "--ignore-submodules=none"])?;
+    let dirty = git(
+        src,
+        &[
+            "status",
+            "--porcelain",
+            "--ignored",
+            "--ignore-submodules=none",
+        ],
+    )?;
     if !dirty.is_empty() {
         bail!(
             "{} has local changes, so it is not the pinned source:\n{dirty}\nDelete it to start over.",
@@ -109,24 +163,24 @@ fn source(recipe: &BuildPlan, src: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Unpacks the OpenVINO wheel's libraries, headers and CMake config, once per digest.
+/// Unpacks the OpenVINO wheel's libraries, headers and CMake config. The wheel
+/// is kept to save a download, but re-hashed and re-extracted on every run:
+/// nothing extracted earlier is trusted.
 fn openvino(
     recipe: &BuildPlan,
     root: &Path,
     fetch: &dyn Fn(&str, &str, &str, &Path) -> Result<()>,
 ) -> Result<PathBuf> {
     let input = &recipe.openvino_wheel;
-    let dir = root.join("openvino");
-    let marker = root.join("openvino.sha256");
-    if fs::read_to_string(&marker).ok().as_deref() == Some(input.sha256.as_str()) {
-        return Ok(dir);
+    let whl = root.join("openvino.whl");
+    let cached = fs::read(&whl).is_ok_and(|b| net::sha256_hex(&b) == input.sha256);
+    if !cached {
+        fetch(&input.id, &input.url, &input.sha256, &whl)?;
     }
-    let _ = fs::remove_file(&marker);
+    let dir = root.join("openvino");
     if dir.exists() {
         fs::remove_dir_all(&dir)?;
     }
-    let whl = root.join("openvino.whl");
-    fetch(&input.id, &input.url, &input.sha256, &whl)?;
     install::unzip(
         &whl,
         root,
@@ -137,8 +191,6 @@ fn openvino(
         },
         false,
     )?;
-    fs::remove_file(&whl)?;
-    fs::write(&marker, &input.sha256)?;
     Ok(dir)
 }
 
@@ -174,19 +226,24 @@ pub fn stage(
         .mode(0o700)
         .create(&root)
         .with_context(|| format!("creating {}", root.display()))?;
-    eprintln!(
-        "building in {} (kept for incremental rebuilds)",
-        root.display()
-    );
+    ensure_private(&opts.build_dir)?;
+    ensure_private(&root)?;
+    eprintln!("building in {}", root.display());
 
     let ov = openvino(recipe, &root, fetch)?;
     let src = root.join("onnxruntime");
     source(recipe, &src)?;
 
+    // Objects from an earlier run cannot be checked, so every build starts clean.
     let out = root.join("out");
+    if out.exists() {
+        fs::remove_dir_all(&out)?;
+    }
     let mut defines = vec![format!("OpenVINO_DIR={}", ov.join("cmake").display())];
     defines.extend(recipe.cmake_defines.iter().cloned());
+    // -B: bytecode written into the tree would fail the next run's clean check.
     run(Command::new("python3")
+        .args(["-B", "-E", "-s"])
         .arg(src.join("tools/ci_build/build.py"))
         .arg("--build_dir")
         .arg(&out)
@@ -232,6 +289,17 @@ pub fn stage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refuses_a_build_dir_others_can_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = install::TempDir::new().unwrap();
+        ensure_private(&dir.0).unwrap();
+        fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(ensure_private(&dir.0).is_err());
+        fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(ensure_private(Path::new("/")).is_err() || euid().unwrap() == 0);
+    }
 
     #[test]
     fn copies_the_runtime_the_prebuilt_wheel_ships_and_nothing_else() {

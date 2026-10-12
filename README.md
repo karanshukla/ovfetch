@@ -59,11 +59,11 @@ A recipe in `data/builds.toml` pins every input, and `install --build` checks ea
 | OpenVINO | The PyPI `openvino` wheel, with its headers, CMake config and libraries. It goes through the same source agreement and ledger as every other artifact, so the OpenVINO installed is byte for byte the one Python programs on the machine run. |
 | Build flags | Part of the recipe. |
 
-The plan's `sha256` for a build is a digest of those inputs, not of the output: compiled libraries differ between compilers, so the output cannot be pinned in the ledger. The lock records the compiler and CMake that built it, and `SHA256SUMS` covers the installed files as usual, so `verify` works the same. Every installed library must search only `$ORIGIN` for its dependencies, so nothing can load from the build tree later.
+The plan's `sha256` for a build is a digest of those inputs, not of the output: compiled libraries differ between compilers, so the output cannot be pinned in the ledger. The lock records the compiler and CMake that built it, and `SHA256SUMS` covers the installed files as usual, so `verify` works the same. Every installed library must search only `$ORIGIN` for its dependencies, so nothing can load from the build tree later. The build tree is executed and installed from, so `--build` refuses a build directory that is not owned by the user running ovfetch or that anyone else can write, and runs git with system, global and hook config ignored.
 
 What it does not cover: ONNX Runtime's CMake dependencies are downloaded by CMake, not ovfetch, so they are outside the host allowlist below. CMake checks each against the hash in the pinned source's `cmake/deps.txt`, which is SHA-1.
 
-It needs git, cmake, ninja, python3 and a C++ compiler, 17 minutes with `--jobs 3` on a Dell XPS 13 (Core 5 320, measured 2026-10-12), and several GB under `~/.cache/ovfetch/build` (`--build-dir`), kept so a rerun is incremental. `--jobs` defaults to half the CPUs; ONNX Runtime's compile is memory-hungry.
+It needs git, cmake, ninja, python3 and a C++ compiler, 17 minutes with `--jobs 3` on a Dell XPS 13 (Core 5 320, measured 2026-10-12), and several GB under `~/.cache/ovfetch/build` (`--build-dir`). The clone and the OpenVINO wheel are kept to save downloads, but the clone is re-checked and the wheel re-hashed and re-extracted on every run, and the build itself always starts clean: compiled objects from an earlier run cannot be verified. `--jobs` defaults to half the CPUs; ONNX Runtime's compile is memory-hungry.
 
 ## How it decides a hash is trustworthy
 
