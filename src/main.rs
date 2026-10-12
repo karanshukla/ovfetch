@@ -26,6 +26,9 @@ enum Cmd {
         /// Allow an OpenVINO newer than the installed NPU driver is paired with.
         #[arg(long)]
         ignore_driver: bool,
+        /// Consider compiling ONNX Runtime from a recipe in data/builds.toml.
+        #[arg(long)]
+        build: bool,
         #[arg(long)]
         json: bool,
     },
@@ -47,6 +50,16 @@ enum Cmd {
         /// Reinstall even when --prefix already holds the resolved build.
         #[arg(long)]
         force: bool,
+        /// Compile ONNX Runtime from a recipe in data/builds.toml when it
+        /// offers a newer OpenVINO than any prebuilt that fits.
+        #[arg(long)]
+        build: bool,
+        /// Where --build keeps sources and objects [default: ~/.cache/ovfetch/build]
+        #[arg(long)]
+        build_dir: Option<PathBuf>,
+        /// Parallel compile jobs for --build [default: half the CPUs]
+        #[arg(long)]
+        jobs: Option<usize>,
     },
     /// Re-hash an installed prefix against the SHA256SUMS written at install.
     Verify {
@@ -70,6 +83,15 @@ enum CiCmd {
     Discover,
 }
 
+fn default_build_dir() -> Result<PathBuf> {
+    let cache = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .ok_or_else(|| anyhow::anyhow!("no XDG_CACHE_HOME or HOME; pass --build-dir"))?;
+    Ok(cache.join("ovfetch/build"))
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let data = data::Data::load(cli.data_dir.as_deref())?;
@@ -84,6 +106,7 @@ fn main() -> Result<()> {
         Cmd::Resolve {
             min_openvino,
             ignore_driver,
+            build,
             json,
         } => {
             let plan = resolve::resolve(
@@ -91,6 +114,7 @@ fn main() -> Result<()> {
                 &data,
                 min_openvino.as_deref(),
                 ignore_driver,
+                build,
             )?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&plan)?);
@@ -107,8 +131,21 @@ fn main() -> Result<()> {
                     "openvino: {} (onnxruntime-openvino {}, {:?})",
                     plan.openvino, plan.artifact.onnxruntime, plan.artifact.trust
                 );
-                println!("download: {}", plan.artifact.url);
-                println!("sha256:   {}", plan.artifact.sha256);
+                match &plan.artifact.build {
+                    Some(b) => {
+                        println!("build:    {} {} @ {}", b.git_repo, b.git_tag, b.git_commit);
+                        println!(
+                            "against:  {} ({:?})",
+                            b.openvino_wheel.url, b.openvino_wheel.trust
+                        );
+                        println!("          sha256 {}", b.openvino_wheel.sha256);
+                        println!("recipe:   {}", plan.artifact.sha256);
+                    }
+                    None => {
+                        println!("download: {}", plan.artifact.url);
+                        println!("sha256:   {}", plan.artifact.sha256);
+                    }
+                }
                 for w in &plan.warnings {
                     println!("warning:  {w}");
                 }
@@ -121,17 +158,25 @@ fn main() -> Result<()> {
             allow_unverified,
             allow_downgrade,
             force,
+            build,
+            build_dir,
+            jobs,
         } => {
             let plan = resolve::resolve(
                 &detect::machine(),
                 &data,
                 min_openvino.as_deref(),
                 ignore_driver,
+                build,
             )?;
             let opts = install::Options {
                 allow_unverified,
                 allow_downgrade,
                 force,
+                build_dir: build_dir.map_or_else(default_build_dir, Ok)?,
+                jobs: jobs.unwrap_or_else(|| {
+                    std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1))
+                }),
             };
             for w in &plan.warnings {
                 eprintln!("warning: {w}");

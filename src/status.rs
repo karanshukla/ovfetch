@@ -170,6 +170,7 @@ mod tests {
             platforms: Platforms::default(),
             npu_drivers: NpuDrivers { list: drivers },
             ledger: Ledger::default(),
+            builds: Default::default(),
         }
     }
 

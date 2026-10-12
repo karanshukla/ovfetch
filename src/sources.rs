@@ -270,6 +270,22 @@ pub fn github_raw(repo: &str, git_ref: &str, path: &str) -> Result<String> {
     ))
 }
 
+/// The commit a tag points at, following an annotated tag to its commit.
+pub fn github_tag_commit(repo: &str, tag: &str) -> Result<String> {
+    let json = net::get_json(&format!(
+        "https://api.github.com/repos/{repo}/git/ref/tags/{tag}"
+    ))?;
+    let mut object = json["object"].clone();
+    if object["type"] == "tag" {
+        let url = object["url"].as_str().context("tag object has no url")?;
+        object = net::get_json(url)?["object"].clone();
+    }
+    object["sha"]
+        .as_str()
+        .map(str::to_owned)
+        .with_context(|| format!("GitHub returned no commit for {repo} {tag}"))
+}
+
 /// Filenames PyPI reports a PEP 740 provenance attestation for.
 pub fn pypi_provenance(project: &str) -> Result<Vec<String>> {
     let json = net::get_json_accept(

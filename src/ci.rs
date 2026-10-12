@@ -92,6 +92,25 @@ pub fn audit(data: &Data, sample: usize) -> Result<String> {
         }
     }
 
+    for b in &data.builds.list {
+        let id = format!("build {} {}", b.git_repo, b.git_tag);
+        checked += 1;
+        if data.ledger.get(&b.openvino_wheel).is_none() {
+            problems.push(format!(
+                "- `{id}`: input {} is not in the ledger",
+                b.openvino_wheel
+            ));
+        }
+        match sources::github_tag_commit(&b.git_repo, &b.git_tag) {
+            Ok(c) if c == b.git_commit => {}
+            Ok(c) => problems.push(format!(
+                "- `{id}`: tag now points at {c}, recipe pins {}",
+                b.git_commit
+            )),
+            Err(e) => problems.push(format!("- `{id}`: {e:#}")),
+        }
+    }
+
     // Index pages can agree while a mirror serves different bytes, so download
     // a random few from a random mirror and hash what actually arrives.
     let start = std::time::SystemTime::now()

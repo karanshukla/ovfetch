@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-12
+
+### Added
+
+- `--build` on `resolve` and `install`: compile ONNX Runtime from a reviewed recipe in `data/builds.toml` when it offers a newer OpenVINO than every prebuilt that fits. The source is pinned by commit and OpenVINO is the PyPI wheel, checked like any other artifact. Without `--build`, `resolve` names the newer recipe in a warning.
+- The first recipe: ONNX Runtime 1.24.1 with OpenVINO 2026.4.1.
+- `install` refuses any library whose RPATH or RUNPATH reaches outside `$ORIGIN`.
+- `ci audit` checks each recipe's tag still points at its pinned commit and its OpenVINO wheel is in the ledger.
+
+### Changed
+
+- `resolve::resolve` takes an `allow_build` argument, and `install::Options` gains `build_dir` and `jobs`.
+
 ## [0.3.0] - 2026-10-03
 
 ### Security
@@ -58,7 +71,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial release: resolve, verify and install prebuilt ONNX Runtime and OpenVINO for Intel NPUs.
 
-[Unreleased]: https://github.com/karanshukla/ovfetch/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/karanshukla/ovfetch/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/karanshukla/ovfetch/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/karanshukla/ovfetch/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/karanshukla/ovfetch/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/karanshukla/ovfetch/compare/v0.2.0...v0.2.1

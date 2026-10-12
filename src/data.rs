@@ -83,6 +83,32 @@ pub struct Entry {
     pub provenance: bool,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Builds {
+    #[serde(default, rename = "build")]
+    pub list: Vec<Build>,
+}
+
+/// A reviewed recipe for compiling ONNX Runtime against an OpenVINO wheel,
+/// for when no prebuilt bundles the OpenVINO a device should run. Every
+/// input is pinned: the source by commit, OpenVINO by its ledger entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Build {
+    pub onnxruntime: String,
+    pub openvino: String,
+    pub git_repo: String,
+    pub git_tag: String,
+    pub git_commit: String,
+    /// Ledger id of the `openvino` wheel whose headers, CMake config and
+    /// libraries the build compiles against and installs.
+    pub openvino_wheel: String,
+    /// Arguments to ONNX Runtime's `tools/ci_build/build.py`.
+    pub build_args: Vec<String>,
+    pub cmake_defines: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 impl Ledger {
     pub fn get(&self, id: &str) -> Option<&Entry> {
         self.list.iter().find(|e| e.id == id)
@@ -94,6 +120,7 @@ pub struct Data {
     pub platforms: Platforms,
     pub npu_drivers: NpuDrivers,
     pub ledger: Ledger,
+    pub builds: Builds,
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(name: &str, text: &str) -> Result<T> {
@@ -122,6 +149,10 @@ impl Data {
             ledger: parse(
                 "ledger.toml",
                 &read("ledger.toml", include_str!("../data/ledger.toml"))?,
+            )?,
+            builds: parse(
+                "builds.toml",
+                &read("builds.toml", include_str!("../data/builds.toml"))?,
             )?,
         })
     }

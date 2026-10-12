@@ -26,7 +26,7 @@ No NPU, no bounds: the newest build wins.
 
 Both bounds are deliberately pessimistic. Measured 2026-09-28 on Wildcat Lake, drivers 1.32.0 and 1.35.0 each compiled and ran a small test model on every OpenVINO from 2025.0 to 2026.4, and whisper-small.en's full pipeline on 2026.4, so neither bound has been seen to fail; the older versions were not tried with a real model. What did fail was a driver without its compiler: Fedora's 1.32.0 rpm ships none, and every `compile_model` then returns `ZE_RESULT_ERROR_UNSUPPORTED_FEATURE`, which looks like a version mismatch and is not one. `detect` checks for the compiler library the installed driver actually loads, since the name changed between 1.32 and 1.35.
 
-**It never compiles anything.** If no prebuilt build fits, it stops and says which bound is in the way. An NPU that is newer than the data (no known floor) is refused too, rather than guessed at.
+**It prefers prebuilt builds, and compiles only when asked.** If no prebuilt build fits, it stops and says which bound is in the way. An NPU that is newer than the data (no known floor) is refused too, rather than guessed at. When a reviewed recipe in `data/builds.toml` offers a newer OpenVINO than every prebuilt that fits, `resolve` says so, and `--build` compiles it (see [Local builds](#local-builds)).
 
 It installs into its own prefix and never touches the distro's OpenVINO, driver, or compiler. It will not replace a newer install in that prefix with an older one unless you pass `--allow-downgrade`.
 
@@ -41,6 +41,29 @@ ovfetch verify --prefix /usr/local/lib/face-auth/openvino          # re-hash an 
 ```
 
 `--min-openvino 2026.2` overrides the floor. `--ignore-driver` lifts the ceiling, at your own risk.
+
+## Local builds
+
+Intel's onnxruntime-openvino wheels lag OpenVINO itself: as of 2026-10-12 the newest bundles 2025.4.1 while OpenVINO is at 2026.4.1. Two programs on one NPU running different OpenVINO releases is a real failure, not a style issue: an NPU fault resets the device for every process using it. So ovfetch can compile ONNX Runtime against a newer OpenVINO, without giving up being the one place the version and its provenance come from.
+
+```bash
+ovfetch resolve --build                                        # the recipe, its pinned inputs, nothing built
+ovfetch install --build --prefix ~/.local/lib/app/ort          # compile, then install like any other build
+```
+
+A recipe in `data/builds.toml` pins every input, and `install --build` checks each one before it compiles:
+
+| Input | How it is checked |
+|---|---|
+| ONNX Runtime source | Cloned at the recipe's tag, which must resolve to its pinned commit (GitHub is asked at resolve time, and the clone's `HEAD` must match). A tree with local changes is refused. |
+| OpenVINO | The PyPI `openvino` wheel, with its headers, CMake config and libraries. It goes through the same source agreement and ledger as every other artifact, so the OpenVINO installed is byte for byte the one Python programs on the machine run. |
+| Build flags | Part of the recipe. |
+
+The plan's `sha256` for a build is a digest of those inputs, not of the output: compiled libraries differ between compilers, so the output cannot be pinned in the ledger. The lock records the compiler and CMake that built it, and `SHA256SUMS` covers the installed files as usual, so `verify` works the same. Every installed library must search only `$ORIGIN` for its dependencies, so nothing can load from the build tree later. The build tree is executed and installed from, so `--build` refuses a build directory that is not owned by the user running ovfetch or that anyone else can write, and runs git with system, global and hook config ignored.
+
+What it does not cover: ONNX Runtime's CMake dependencies are downloaded by CMake, not ovfetch, so they are outside the host allowlist below. CMake checks each against the hash in the pinned source's `cmake/deps.txt`, which is SHA-1.
+
+It needs git, cmake, ninja, python3 and a C++ compiler, 17 minutes with `--jobs 3` on a Dell XPS 13 (Core 5 320, measured 2026-10-12), and several GB under `~/.cache/ovfetch/build` (`--build-dir`). The clone and the OpenVINO wheel are kept to save downloads, but the clone is re-checked and the wheel re-hashed and re-extracted on every run, and the build itself always starts clean: compiled objects from an earlier run cannot be verified. `--jobs` defaults to half the CPUs; ONNX Runtime's compile is memory-hungry.
 
 ## How it decides a hash is trustworthy
 
