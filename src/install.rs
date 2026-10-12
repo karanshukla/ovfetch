@@ -1,8 +1,9 @@
 //! Downloading, re-verifying, assembling, and installing a resolved plan.
 
+use crate::build;
 use crate::consensus::Trust;
 use crate::net;
-use crate::resolve::Plan;
+use crate::resolve::{Kind, Plan};
 use crate::version::Ver;
 use anyhow::{Context, Result, bail};
 use std::fs;
@@ -13,13 +14,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const SUMS: &str = "SHA256SUMS";
 const LOCK: &str = "ovfetch.lock.json";
 
-struct TempDir(PathBuf);
+pub(crate) struct TempDir(pub(crate) PathBuf);
 
 impl TempDir {
     /// A new directory only the current user can enter. Install runs as root
     /// and copies what lands here into the prefix, so a path someone else
     /// created first in /tmp is an error, not something to reuse.
-    fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.subsec_nanos();
         let p = std::env::temp_dir().join(format!("ovfetch-{}-{nanos}", std::process::id()));
         fs::DirBuilder::new()
@@ -40,7 +41,7 @@ impl Drop for TempDir {
 /// unreachable. Mirrors otherwise just vote on the hash. A digest mismatch
 /// aborts rather than falling through: it means the bytes served differ from
 /// what every source agreed on.
-fn fetch(urls: &[String], sha256: &str, dest: &Path) -> Result<()> {
+pub(crate) fn fetch(urls: &[String], sha256: &str, dest: &Path) -> Result<()> {
     let mut last = None;
     for url in urls {
         match net::download(url, dest) {
@@ -57,7 +58,12 @@ fn fetch(urls: &[String], sha256: &str, dest: &Path) -> Result<()> {
     Err(last.unwrap_or_else(|| anyhow::anyhow!("no source to download from")))
 }
 
-fn unzip(archive: &Path, dest: &Path, keep: impl Fn(&str) -> bool, flatten: bool) -> Result<()> {
+pub(crate) fn unzip(
+    archive: &Path,
+    dest: &Path,
+    keep: impl Fn(&str) -> bool,
+    flatten: bool,
+) -> Result<()> {
     let mut zip = zip::ZipArchive::new(fs::File::open(archive)?)?;
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i)?;
@@ -79,7 +85,7 @@ fn unzip(archive: &Path, dest: &Path, keep: impl Fn(&str) -> bool, flatten: bool
     Ok(())
 }
 
-fn is_runtime_lib(name: &str) -> bool {
+pub(crate) fn is_runtime_lib(name: &str) -> bool {
     let file = name.rsplit('/').next().unwrap_or(name);
     file.starts_with("lib") && file.contains(".so")
 }
@@ -147,6 +153,22 @@ fn normalise_links(lib: &Path) -> Result<()> {
 
 /// DT_SONAME of a little-endian ELF64 shared object, if it has one.
 fn soname(elf: &[u8]) -> Option<String> {
+    dynamic_strings(elf, 14)?.into_iter().next()
+}
+
+/// Every RPATH and RUNPATH entry, `None` when `elf` is not one ovfetch can read.
+pub(crate) fn search_paths(elf: &[u8]) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    for tag in [15, 29] {
+        for s in dynamic_strings(elf, tag)? {
+            out.extend(s.split(':').filter(|p| !p.is_empty()).map(str::to_owned));
+        }
+    }
+    Some(out)
+}
+
+/// Strings for one `.dynamic` tag of a little-endian ELF64 file.
+fn dynamic_strings(elf: &[u8], tag: usize) -> Option<Vec<String>> {
     fn uint(b: &[u8], at: usize, len: usize) -> Option<usize> {
         let raw = b.get(at..at.checked_add(len)?)?;
         Some(raw.iter().rev().fold(0usize, |a, &x| (a << 8) | x as usize))
@@ -158,6 +180,7 @@ fn soname(elf: &[u8]) -> Option<String> {
     let shentsize = uint(elf, 0x3a, 2)?;
     let shnum = uint(elf, 0x3c, 2)?;
     let section = |i: usize| shoff.checked_add(i.checked_mul(shentsize)?);
+    let mut out = Vec::new();
     for i in 0..shnum {
         let sh = section(i)?;
         if uint(elf, sh + 4, 4)? != 6 {
@@ -167,15 +190,37 @@ fn soname(elf: &[u8]) -> Option<String> {
         let strtab = section(uint(elf, sh + 0x28, 4)?)?;
         let str_off = uint(elf, strtab + 0x18, 8)?;
         for d in (off..off.checked_add(size)?).step_by(16) {
-            if uint(elf, d, 8)? == 14 {
+            if uint(elf, d, 8)? == tag {
                 let start = str_off.checked_add(uint(elf, d + 8, 8)?)?;
                 let name = elf.get(start..)?;
                 let end = name.iter().position(|&c| c == 0)?;
-                return String::from_utf8(name[..end].to_vec()).ok();
+                out.push(String::from_utf8(name[..end].to_vec()).ok()?);
             }
         }
     }
-    None
+    Some(out)
+}
+
+/// A library may only search its own directory: an absolute RUNPATH from a
+/// build tree would load whatever sits there later, outside SHA256SUMS.
+pub(crate) fn check_search_paths(lib: &Path) -> Result<()> {
+    for e in fs::read_dir(lib)?.flatten() {
+        let path = e.path();
+        if !path.is_file() || path.is_symlink() {
+            continue;
+        }
+        let paths = search_paths(&fs::read(&path)?).unwrap_or_default();
+        if let Some(bad) = paths
+            .iter()
+            .find(|p| *p != "$ORIGIN" && !p.starts_with("$ORIGIN/"))
+        {
+            bail!(
+                "{} searches {bad} for libraries; only $ORIGIN is allowed",
+                path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn write_sums(dir: &Path) -> Result<()> {
@@ -269,6 +314,9 @@ pub struct Options {
     pub allow_unverified: bool,
     pub allow_downgrade: bool,
     pub force: bool,
+    /// Where `--build` keeps sources and objects between runs.
+    pub build_dir: PathBuf,
+    pub jobs: usize,
 }
 
 fn installed_sha256(prefix: &Path) -> Option<String> {
@@ -337,22 +385,44 @@ pub fn install(
     let lib = tmp.0.join("lib");
     fs::create_dir_all(&lib)?;
 
-    let whl = tmp.0.join("ort.whl");
-    let mut urls = mirror_urls(&plan.artifact.id);
-    if urls.is_empty() {
-        urls.push(plan.artifact.url.clone());
+    let fetch_input = |id: &str, url: &str, sha256: &str, dest: &Path| {
+        let mut urls = mirror_urls(id);
+        if urls.is_empty() {
+            urls.push(url.to_owned());
+        }
+        fetch(&urls, sha256, dest)
+    };
+    let mut lock = serde_json::to_value(plan)?;
+    match plan.artifact.kind {
+        Kind::Wheel => {
+            let whl = tmp.0.join("ort.whl");
+            fetch_input(
+                &plan.artifact.id,
+                &plan.artifact.url,
+                &plan.artifact.sha256,
+                &whl,
+            )?;
+            unzip(
+                &whl,
+                &lib,
+                |n| n.starts_with("onnxruntime/capi/") && is_runtime_lib(n),
+                true,
+            )?;
+        }
+        Kind::Build => {
+            let recipe = plan
+                .artifact
+                .build
+                .as_ref()
+                .context("build plan without a recipe")?;
+            lock["built"] = build::stage(plan, recipe, &lib, opts, &fetch_input)?;
+        }
     }
-    fetch(&urls, &plan.artifact.sha256, &whl)?;
-    unzip(
-        &whl,
-        &lib,
-        |n| n.starts_with("onnxruntime/capi/") && is_runtime_lib(n),
-        true,
-    )?;
 
     normalise_links(&lib)?;
+    check_search_paths(&lib)?;
     write_sums(&lib)?;
-    fs::write(lib.join(LOCK), serde_json::to_string_pretty(plan)?)?;
+    fs::write(lib.join(LOCK), serde_json::to_string_pretty(&lock)?)?;
     verify(&lib)?;
 
     fs::create_dir_all(prefix).with_context(|| format!("creating {}", prefix.display()))?;
@@ -371,9 +441,14 @@ pub fn install(
     }
     verify(prefix)?;
     eprintln!(
-        "installed ONNX Runtime {} + OpenVINO {} into {}",
+        "installed ONNX Runtime {} + OpenVINO {}{} into {}",
         plan.artifact.onnxruntime,
         plan.openvino,
+        if plan.artifact.kind == Kind::Build {
+            " (built here)"
+        } else {
+            ""
+        },
         prefix.display()
     );
     Ok(())
@@ -393,6 +468,20 @@ mod tests {
         };
         assert_eq!(soname(&libc).as_deref(), Some("libc.so.6"));
         assert_eq!(soname(b"not elf"), None);
+    }
+
+    #[test]
+    fn libraries_may_only_search_their_own_directory() {
+        let Some(libc) = ["/lib/x86_64-linux-gnu/libc.so.6", "/usr/lib64/libc.so.6"]
+            .iter()
+            .find_map(|p| fs::read(p).ok())
+        else {
+            return;
+        };
+        assert_eq!(search_paths(&libc), Some(vec![]));
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.0.join("libx.so"), &libc).unwrap();
+        check_search_paths(&dir.0).unwrap();
     }
 
     #[test]

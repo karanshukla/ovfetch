@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `--build` on `resolve` and `install`: compile ONNX Runtime from a reviewed recipe in `data/builds.toml` when it offers a newer OpenVINO than every prebuilt that fits. The source is pinned by commit and OpenVINO is the PyPI wheel, checked like any other artifact. Without `--build`, `resolve` names the newer recipe in a warning.
+- The first recipe: ONNX Runtime 1.24.1 with OpenVINO 2026.4.1.
+- `install` refuses any library whose RPATH or RUNPATH reaches outside `$ORIGIN`.
+- `ci audit` checks each recipe's tag still points at its pinned commit and its OpenVINO wheel is in the ledger.
+
 ## [0.3.0] - 2026-10-03
 
 ### Security

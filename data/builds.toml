@@ -1,0 +1,27 @@
+# Recipes for `ovfetch install --build`, reviewed by hand; `ci discover` never
+# writes this file. A recipe is only used when its OpenVINO is newer than every
+# prebuilt that fits the device, and its `openvino_wheel` must be in the ledger.
+
+[[build]]
+onnxruntime = "1.24.1"
+openvino = "2026.4.1"
+git_repo = "microsoft/onnxruntime"
+git_tag = "v1.24.1"
+git_commit = "470ae16099a74fe05e31f2530489332c0525edb5"
+openvino_wheel = "pypi/openvino/openvino-2026.4.1-22982-cp313-cp313-manylinux_2_28_x86_64.whl"
+build_args = [
+    "--config", "Release",
+    "--use_openvino",
+    "--build_shared_lib",
+    "--skip_tests",
+    "--skip_submodule_sync",
+    "--cmake_generator", "Ninja",
+    "--compile_no_warning_as_error",
+]
+cmake_defines = [
+    "onnxruntime_BUILD_UNIT_TESTS=OFF",
+    "CMAKE_POLICY_VERSION_MINIMUM=3.5",
+    "CMAKE_BUILD_WITH_INSTALL_RPATH=ON",
+    "CMAKE_INSTALL_RPATH=$ORIGIN",
+]
+note = "No onnxruntime-openvino wheel bundles 2026.4 (newest: 1.24.1 with 2025.4.1). This pairs the same ONNX Runtime with the OpenVINO vinoWhisper's openvino-genai runs, so both share one NPU stack."

@@ -1,23 +1,54 @@
 //! Turning "the right OpenVINO for this machine" into one concrete, hash-checked download.
 //!
-//! Only prebuilt ONNX Runtime + OpenVINO builds are ever installed. When none
-//! fits the device, resolution fails and says why; ovfetch never compiles.
+//! Prebuilt ONNX Runtime + OpenVINO wheels are preferred. A reviewed build
+//! recipe (`data/builds.toml`) is chosen only with `--build`, and only when its
+//! OpenVINO is newer than every prebuilt that fits the device.
 
 use crate::consensus::{self, Trust};
-use crate::data::Data;
+use crate::data::{Build, Data};
 use crate::detect::Machine;
+use crate::net;
 use crate::sources::{self, PypiFile};
 use crate::status::{Floor, compiler_warning, driver_ceiling, floor};
 use crate::version::Ver;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
-/// Intel's onnxruntime-openvino wheel: ONNX Runtime and the OpenVINO EP,
-/// built together against the OpenVINO it bundles.
+/// What gets installed: Intel's onnxruntime-openvino wheel, or ONNX Runtime
+/// compiled here from a recipe. For a build, `sha256` digests the recipe's
+/// inputs, since compiled output differs between toolchains.
 #[derive(Debug, Clone, Serialize)]
 pub struct Artifact {
     pub id: String,
     pub onnxruntime: String,
+    pub url: String,
+    pub sha256: String,
+    pub trust: Trust,
+    pub kind: Kind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build: Option<BuildPlan>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    Wheel,
+    Build,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BuildPlan {
+    pub git_repo: String,
+    pub git_tag: String,
+    pub git_commit: String,
+    pub openvino_wheel: Input,
+    pub build_args: Vec<String>,
+    pub cmake_defines: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Input {
+    pub id: String,
     pub url: String,
     pub sha256: String,
     pub trust: Trust,
@@ -41,15 +72,104 @@ pub struct Plan {
     pub warnings: Vec<String>,
 }
 
-fn artifact(file: &PypiFile, data: &Data) -> Result<Artifact> {
+fn agreed(file: &PypiFile, data: &Data) -> Result<(String, Trust)> {
     let claims = sources::pypi_claims(file, &sources::mirror_pages(&file.project));
-    let (sha256, trust) = consensus::agree(&file.ledger_id(), &claims, &data.ledger)?;
+    consensus::agree(&file.ledger_id(), &claims, &data.ledger)
+}
+
+fn artifact(file: &PypiFile, data: &Data) -> Result<Artifact> {
+    let (sha256, trust) = agreed(file, data)?;
     Ok(Artifact {
         id: file.ledger_id(),
         onnxruntime: file.version.clone(),
         url: file.url.clone(),
         sha256,
         trust,
+        kind: Kind::Wheel,
+        build: None,
+    })
+}
+
+/// The newest recipe whose OpenVINO sits between the floor and the ceiling.
+pub fn pick_build<'a>(builds: &'a [Build], need: &Ver, ceiling: Option<&Ver>) -> Option<&'a Build> {
+    builds
+        .iter()
+        .filter_map(|b| Some((b, Ver::parse(&b.openvino)?)))
+        .filter(|(_, ov)| ov.minor() >= *need && ceiling.is_none_or(|c| ov.minor() <= *c))
+        .max_by(|(a, x), (b, y)| {
+            x.cmp(y)
+                .then(Ver::parse(&a.onnxruntime).cmp(&Ver::parse(&b.onnxruntime)))
+        })
+        .map(|(b, _)| b)
+}
+
+/// Digest of everything that decides what a recipe compiles. Paths and job
+/// counts are left out: they change where it builds, not what.
+pub fn recipe_digest(build: &Build, openvino_sha256: &str) -> String {
+    let mut text = format!(
+        "ovfetch-build-v1\nsource {} {}\nopenvino {openvino_sha256}\n",
+        build.git_repo, build.git_commit
+    );
+    for a in &build.build_args {
+        text.push_str(&format!("arg {a}\n"));
+    }
+    for d in &build.cmake_defines {
+        text.push_str(&format!("define {d}\n"));
+    }
+    net::sha256_hex(text.as_bytes())
+}
+
+fn build_artifact(build: &Build, data: &Data) -> Result<Artifact> {
+    let (project, filename) = build
+        .openvino_wheel
+        .strip_prefix("pypi/")
+        .and_then(|r| r.split_once('/'))
+        .with_context(|| format!("recipe input {} is not a PyPI file", build.openvino_wheel))?;
+    let wheel = sources::pypi_wheels(project)?
+        .into_iter()
+        .find(|w| w.filename == filename)
+        .with_context(|| format!("{} is no longer on PyPI", build.openvino_wheel))?;
+    let (sha256, trust) = agreed(&wheel, data)?;
+    match sources::github_tag_commit(&build.git_repo, &build.git_tag) {
+        Ok(c) if c == build.git_commit => {}
+        Ok(c) => bail!(
+            "{} tag {} now points at {c}, but the recipe pins {}. A release tag moved; nothing was built.",
+            build.git_repo,
+            build.git_tag,
+            build.git_commit
+        ),
+        // The clone still has to land on the pinned commit.
+        Err(e) => eprintln!(
+            "note: could not ask GitHub where {} points: {e:#}",
+            build.git_tag
+        ),
+    }
+    Ok(Artifact {
+        id: format!(
+            "build/onnxruntime-{}+openvino-{}",
+            build.onnxruntime, build.openvino
+        ),
+        onnxruntime: build.onnxruntime.clone(),
+        url: format!(
+            "https://github.com/{}/tree/{}",
+            build.git_repo, build.git_commit
+        ),
+        sha256: recipe_digest(build, &sha256),
+        trust,
+        kind: Kind::Build,
+        build: Some(BuildPlan {
+            git_repo: build.git_repo.clone(),
+            git_tag: build.git_tag.clone(),
+            git_commit: build.git_commit.clone(),
+            openvino_wheel: Input {
+                id: build.openvino_wheel.clone(),
+                url: wheel.url,
+                sha256,
+                trust,
+            },
+            build_args: build.build_args.clone(),
+            cmake_defines: build.cmake_defines.clone(),
+        }),
     })
 }
 
@@ -58,6 +178,7 @@ pub fn resolve(
     data: &Data,
     override_min: Option<&str>,
     ignore_driver: bool,
+    allow_build: bool,
 ) -> Result<Plan> {
     let floor = floor(machine, data, override_min);
     let mut warnings = Vec::new();
@@ -114,20 +235,39 @@ pub fn resolve(
             break;
         }
     }
-    let Some((wheel, openvino)) = chosen else {
+    let recipe = pick_build(&data.builds.list, &need, ceiling.as_ref()).filter(|b| {
+        let ov = Ver::parse(&b.openvino);
+        chosen
+            .as_ref()
+            .is_none_or(|(_, have)| ov.as_ref() > Some(have))
+    });
+    let recipe_hint = |b: &Build| {
+        format!(
+            "OpenVINO {} is available by compiling ONNX Runtime {} here; pass --build",
+            b.openvino, b.onnxruntime
+        )
+    };
+
+    if chosen.is_none() && !(allow_build && recipe.is_some()) {
         let newest = newest_bundled
+            .as_ref()
             .map(|v| v.to_string())
             .unwrap_or_else(|| "none".into());
         bail!(
             "no prebuilt ONNX Runtime + OpenVINO fits this device: it needs OpenVINO >= {need}{}, \
-             and the newest prebuilt build bundles {newest}. ovfetch does not compile ONNX Runtime; \
-             this resolves once Intel publishes a newer onnxruntime-openvino wheel.",
+             and the newest prebuilt build bundles {newest}. {}",
             ceiling
                 .as_ref()
                 .map(|c| format!(" and <= {c} (NPU driver)"))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            match recipe {
+                Some(b) => format!("{}.", recipe_hint(b)),
+                None => "No build recipe fits either; this resolves once Intel publishes a newer \
+                         onnxruntime-openvino wheel or a recipe is added to data/builds.toml."
+                    .into(),
+            }
         );
-    };
+    }
 
     if let Some(c) = &ceiling
         && newest_bundled.as_ref().is_some_and(|n| n.minor() > *c)
@@ -146,7 +286,19 @@ pub fn resolve(
         ));
     }
 
-    let artifact = artifact(&wheel, data)?;
+    let (artifact, openvino) = match (recipe, chosen) {
+        (Some(b), _) if allow_build => (
+            build_artifact(b, data)?,
+            Ver::parse(&b.openvino).context("bad recipe openvino")?,
+        ),
+        (r, Some((wheel, ov))) => {
+            if let Some(b) = r {
+                warnings.push(recipe_hint(b));
+            }
+            (artifact(&wheel, data)?, ov)
+        }
+        (_, None) => unreachable!("bailed above"),
+    };
     let npu = npu_requirements(machine, data, &openvino, &mut warnings);
     Ok(Plan {
         floor,
@@ -213,5 +365,88 @@ fn npu_requirements(machine: &Machine, data: &Data, ov: &Ver, warnings: &mut Vec
         driver_installed: installed,
         driver_required: required.map(|v| v.to_string()),
         compiler_present: machine.npu_compiler,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn recipe(ort: &str, ov: &str) -> Build {
+        Build {
+            onnxruntime: ort.into(),
+            openvino: ov.into(),
+            git_repo: "microsoft/onnxruntime".into(),
+            git_tag: format!("v{ort}"),
+            git_commit: "c0ffee".into(),
+            openvino_wheel: "pypi/openvino/x.whl".into(),
+            build_args: vec!["--use_openvino".into()],
+            cmake_defines: vec!["CMAKE_INSTALL_RPATH=$ORIGIN".into()],
+            note: None,
+        }
+    }
+
+    fn v(s: &str) -> Ver {
+        Ver::parse(s).unwrap()
+    }
+
+    #[test]
+    fn picks_the_newest_recipe_inside_the_bounds() {
+        let builds = [
+            recipe("1.24.1", "2026.4.1"),
+            recipe("1.24.1", "2026.2.0"),
+            recipe("1.25.0", "2026.6.0"),
+        ];
+        let got = pick_build(&builds, &v("2025.4"), Some(&v("2026.4"))).unwrap();
+        assert_eq!(got.openvino, "2026.4.1");
+        assert_eq!(
+            pick_build(&builds, &v("2025.4"), None).unwrap().openvino,
+            "2026.6.0"
+        );
+        assert!(pick_build(&builds, &v("2026.7"), None).is_none());
+    }
+
+    #[test]
+    fn same_openvino_prefers_the_newer_onnxruntime() {
+        let builds = [recipe("1.24.1", "2026.4.1"), recipe("1.25.0", "2026.4.1")];
+        assert_eq!(
+            pick_build(&builds, &v("2025.4"), None).unwrap().onnxruntime,
+            "1.25.0"
+        );
+    }
+
+    #[test]
+    fn the_recipe_digest_covers_every_input() {
+        let base = recipe("1.24.1", "2026.4.1");
+        let d = recipe_digest(&base, "aa");
+        assert_eq!(d, recipe_digest(&base.clone(), "aa"));
+        assert_ne!(d, recipe_digest(&base, "bb"));
+        let mut other = base.clone();
+        other.git_commit = "decaf".into();
+        assert_ne!(d, recipe_digest(&other, "aa"));
+        let mut other = base.clone();
+        other.cmake_defines.push("X=1".into());
+        assert_ne!(d, recipe_digest(&other, "aa"));
+        let mut other = base;
+        other.build_args.push("--x".into());
+        assert_ne!(d, recipe_digest(&other, "aa"));
+    }
+
+    #[test]
+    fn every_shipped_recipe_pins_a_ledger_input_and_a_full_commit() {
+        let data = Data::load(None).unwrap();
+        for b in &data.builds.list {
+            assert!(
+                data.ledger.get(&b.openvino_wheel).is_some(),
+                "{}",
+                b.openvino_wheel
+            );
+            assert_eq!(b.git_commit.len(), 40, "{}", b.git_commit);
+            assert!(
+                b.cmake_defines
+                    .iter()
+                    .any(|d| d == "CMAKE_INSTALL_RPATH=$ORIGIN")
+            );
+        }
     }
 }

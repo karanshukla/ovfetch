@@ -10,6 +10,8 @@ pub mod status;
 pub mod version;
 
 #[cfg(feature = "cli")]
+pub mod build;
+#[cfg(feature = "cli")]
 pub mod ci;
 #[cfg(feature = "cli")]
 pub mod consensus;
