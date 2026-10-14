@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-13
+
+### Fixed
+
+- A `--build` install now has the unversioned `libopenvino_c.so` and `libopenvino.so` (and `libfoo.so` for every versioned library). The openvino wheel a build installs from ships only sonames, so anything linking OpenVINO directly, such as the `openvino` crate's build script, could not find it.
+
 ## [0.4.0] - 2026-10-12
 
 ### Added
@@ -71,7 +77,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial release: resolve, verify and install prebuilt ONNX Runtime and OpenVINO for Intel NPUs.
 
-[Unreleased]: https://github.com/karanshukla/ovfetch/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/karanshukla/ovfetch/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/karanshukla/ovfetch/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/karanshukla/ovfetch/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/karanshukla/ovfetch/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/karanshukla/ovfetch/compare/v0.2.1...v0.2.2
