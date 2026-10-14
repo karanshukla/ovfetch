@@ -148,6 +148,23 @@ fn normalise_links(lib: &Path) -> Result<()> {
             }
         }
     }
+    // The onnxruntime-openvino wheel ships `libopenvino_c.so`, the name `-lopenvino_c`
+    // and openvino-sys resolve; the openvino wheel a build installs ships only sonames.
+    let mut versioned: Vec<String> = fs::read_dir(lib)?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".so."))
+        .collect();
+    versioned.sort_by_key(|n| (n.len(), n.clone()));
+    for name in versioned {
+        let Some((stem, _)) = name.split_once(".so.") else {
+            continue;
+        };
+        let link = lib.join(format!("{stem}.so"));
+        if link.symlink_metadata().is_err() {
+            symlink(&name, link)?;
+        }
+    }
     Ok(())
 }
 
@@ -482,6 +499,28 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(dir.0.join("libx.so"), &libc).unwrap();
         check_search_paths(&dir.0).unwrap();
+    }
+
+    #[test]
+    fn unversioned_names_link_to_the_shortest_versioned_one() {
+        let dir = TempDir::new().unwrap();
+        let p = &dir.0;
+        fs::write(p.join("libonnxruntime.so.1.24.1"), b"ort").unwrap();
+        fs::write(p.join("libopenvino_c.so.2641"), b"c").unwrap();
+        fs::write(p.join("libopenvino_c.so.2026.4.1"), b"other").unwrap();
+        fs::write(p.join("libtbb.so"), b"own").unwrap();
+        fs::write(p.join("libtbb.so.12"), b"tbb").unwrap();
+        normalise_links(p).unwrap();
+        let target = |n: &str| fs::read_link(p.join(n)).unwrap();
+        assert_eq!(
+            target("libopenvino_c.so"),
+            Path::new("libopenvino_c.so.2641")
+        );
+        assert_eq!(
+            target("libonnxruntime.so"),
+            Path::new("libonnxruntime.so.1")
+        );
+        assert!(!p.join("libtbb.so").is_symlink());
     }
 
     #[test]
