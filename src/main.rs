@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use ovfetch::resolve::Want;
 use ovfetch::{ci, data, detect, install, resolve, sources, status};
 use std::path::PathBuf;
 
@@ -29,10 +30,14 @@ enum Cmd {
         /// Consider compiling ONNX Runtime from a recipe in data/builds.toml.
         #[arg(long)]
         build: bool,
+        /// OpenVINO alone, for programs that call it without ONNX Runtime.
+        #[arg(long, conflicts_with = "build")]
+        openvino_only: bool,
         #[arg(long)]
         json: bool,
     },
-    /// Resolve, download, verify, and install ONNX Runtime with the OpenVINO EP.
+    /// Resolve, download, verify, and install ONNX Runtime with the OpenVINO EP
+    /// (or, with --openvino-only, OpenVINO by itself).
     Install {
         #[arg(long)]
         prefix: PathBuf,
@@ -54,6 +59,10 @@ enum Cmd {
         /// offers a newer OpenVINO than any prebuilt that fits.
         #[arg(long)]
         build: bool,
+        /// Install Intel's openvino wheel alone, without ONNX Runtime: the
+        /// newest OpenVINO that fits, and never a compile.
+        #[arg(long, conflicts_with = "build")]
+        openvino_only: bool,
         /// Where --build keeps sources and objects [default: ~/.cache/ovfetch/build]
         #[arg(long)]
         build_dir: Option<PathBuf>,
@@ -92,6 +101,14 @@ fn default_build_dir() -> Result<PathBuf> {
     Ok(cache.join("ovfetch/build"))
 }
 
+fn want(build: bool, openvino_only: bool) -> Want {
+    if openvino_only {
+        Want::OpenvinoOnly
+    } else {
+        Want::OnnxRuntime { allow_build: build }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let data = data::Data::load(cli.data_dir.as_deref())?;
@@ -107,6 +124,7 @@ fn main() -> Result<()> {
             min_openvino,
             ignore_driver,
             build,
+            openvino_only,
             json,
         } => {
             let plan = resolve::resolve(
@@ -114,7 +132,7 @@ fn main() -> Result<()> {
                 &data,
                 min_openvino.as_deref(),
                 ignore_driver,
-                build,
+                want(build, openvino_only),
             )?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&plan)?);
@@ -127,10 +145,16 @@ fn main() -> Result<()> {
                 if let Some(c) = &plan.driver_ceiling {
                     println!("ceiling:  {c} (newest known to compile on the installed NPU driver)");
                 }
-                println!(
-                    "openvino: {} (onnxruntime-openvino {}, {:?})",
-                    plan.openvino, plan.artifact.onnxruntime, plan.artifact.trust
-                );
+                match &plan.artifact.onnxruntime {
+                    Some(ort) => println!(
+                        "openvino: {} (onnxruntime-openvino {ort}, {:?})",
+                        plan.openvino, plan.artifact.trust
+                    ),
+                    None => println!(
+                        "openvino: {} (alone, {:?})",
+                        plan.openvino, plan.artifact.trust
+                    ),
+                }
                 match &plan.artifact.build {
                     Some(b) => {
                         println!("build:    {} {} @ {}", b.git_repo, b.git_tag, b.git_commit);
@@ -159,6 +183,7 @@ fn main() -> Result<()> {
             allow_downgrade,
             force,
             build,
+            openvino_only,
             build_dir,
             jobs,
         } => {
@@ -167,7 +192,7 @@ fn main() -> Result<()> {
                 &data,
                 min_openvino.as_deref(),
                 ignore_driver,
-                build,
+                want(build, openvino_only),
             )?;
             let opts = install::Options {
                 allow_unverified,

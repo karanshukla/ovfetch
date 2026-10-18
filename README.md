@@ -40,7 +40,7 @@ ovfetch verify --prefix /usr/local/lib/face-auth/openvino          # re-hash an 
 # install skips the download when the prefix already holds the resolved build; --force reinstalls
 ```
 
-`--min-openvino 2026.2` overrides the floor. `--ignore-driver` lifts the ceiling, at your own risk.
+`--openvino-only` installs OpenVINO without ONNX Runtime (see [Without ONNX Runtime](#without-onnx-runtime)). `--min-openvino 2026.2` overrides the floor. `--ignore-driver` lifts the ceiling, at your own risk.
 
 ## Local builds
 
@@ -64,6 +64,17 @@ The plan's `sha256` for a build is a digest of those inputs, not of the output: 
 What it does not cover: ONNX Runtime's CMake dependencies are downloaded by CMake, not ovfetch, so they are outside the host allowlist below. CMake checks each against the hash in the pinned source's `cmake/deps.txt`, which is SHA-1.
 
 It needs git, cmake, ninja, python3 and a C++ compiler, 17 minutes with `--jobs 3` on a Dell XPS 13 (Core 5 320, measured 2026-10-12), and several GB under `~/.cache/ovfetch/build` (`--build-dir`). The clone and the OpenVINO wheel are kept to save downloads, but the clone is re-checked and the wheel re-hashed and re-extracted on every run, and the build itself always starts clean: compiled objects from an earlier run cannot be verified. `--jobs` defaults to half the CPUs; ONNX Runtime's compile is memory-hungry.
+
+## Without ONNX Runtime
+
+Programs that call OpenVINO directly (through its C API, the `openvino` crate, or `openvino-sys`) don't need ONNX Runtime, and so aren't held back by Intel's onnxruntime-openvino wheels:
+
+```bash
+ovfetch resolve --openvino-only
+ovfetch install --openvino-only --prefix ~/.local/lib/app/openvino
+```
+
+This installs Intel's PyPI `openvino` wheel alone: the newest OpenVINO between the floor and the ceiling, through the same source agreement and ledger, and never a compile. It is the same library set `--build` takes from that wheel (runtime, C API, CPU/GPU/NPU/AUTO/HETERO plugins, ONNX frontend, TBB), 139 MB, installed in 17 seconds on a Dell XPS 13 (Core 5 320, measured 2026-10-18). Within a release, a wheel the ledger already records is preferred over a newer CPython tag; the libraries are the same build, and a recorded one installs as verified. The lock has no `artifact.onnxruntime`, and `artifact.kind` is `openvino`.
 
 ## How it decides a hash is trustworthy
 

@@ -92,7 +92,8 @@ pub(crate) fn is_runtime_lib(name: &str) -> bool {
 
 /// Wheels store soname aliases as full copies. Collapse byte-identical files
 /// into symlinks to the longest name, and add the `libonnxruntime.so{,.1}`
-/// names ort-sys links against, which the wheel omits.
+/// names ort-sys links against, which the wheel omits, when there is an ONNX
+/// Runtime at all.
 fn normalise_links(lib: &Path) -> Result<()> {
     let mut files: Vec<PathBuf> = fs::read_dir(lib)?
         .flatten()
@@ -119,18 +120,23 @@ fn normalise_links(lib: &Path) -> Result<()> {
             kept.push((f, bytes));
         }
     }
-    let full = fs::read_dir(lib)?
+    let names: Vec<String> = fs::read_dir(lib)?
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .find(|n| n.starts_with("libonnxruntime.so.") && n.matches('.').count() == 4)
-        .context("no versioned libonnxruntime.so in the build")?;
-    for (link, target) in [
-        ("libonnxruntime.so.1", full.as_str()),
-        ("libonnxruntime.so", "libonnxruntime.so.1"),
-    ] {
-        let p = lib.join(link);
-        if !p.exists() {
-            symlink(target, p)?;
+        .collect();
+    if names.iter().any(|n| n.starts_with("libonnxruntime")) {
+        let full = names
+            .iter()
+            .find(|n| n.starts_with("libonnxruntime.so.") && n.matches('.').count() == 4)
+            .context("no versioned libonnxruntime.so in the build")?;
+        for (link, target) in [
+            ("libonnxruntime.so.1", full.as_str()),
+            ("libonnxruntime.so", "libonnxruntime.so.1"),
+        ] {
+            let p = lib.join(link);
+            if !p.exists() {
+                symlink(target, p)?;
+            }
         }
     }
     for entry in fs::read_dir(lib)?.flatten() {
@@ -426,6 +432,27 @@ pub fn install(
                 true,
             )?;
         }
+        Kind::Openvino => {
+            let whl = tmp.0.join("openvino.whl");
+            fetch_input(
+                &plan.artifact.id,
+                &plan.artifact.url,
+                &plan.artifact.sha256,
+                &whl,
+            )?;
+            unzip(
+                &whl,
+                &lib,
+                |n| {
+                    n.strip_prefix("openvino/libs/")
+                        .is_some_and(|f| !f.contains('/') && build::is_openvino_runtime(f))
+                },
+                true,
+            )?;
+            if fs::read_dir(&lib)?.next().is_none() {
+                bail!("{} holds no OpenVINO libraries", plan.artifact.id);
+            }
+        }
         Kind::Build => {
             let recipe = plan
                 .artifact
@@ -457,10 +484,12 @@ pub fn install(
         }
     }
     verify(prefix)?;
+    let what = match &plan.artifact.onnxruntime {
+        Some(ort) => format!("ONNX Runtime {ort} + OpenVINO {}", plan.openvino),
+        None => format!("OpenVINO {}", plan.openvino),
+    };
     eprintln!(
-        "installed ONNX Runtime {} + OpenVINO {}{} into {}",
-        plan.artifact.onnxruntime,
-        plan.openvino,
+        "installed {what}{} into {}",
         if plan.artifact.kind == Kind::Build {
             " (built here)"
         } else {
@@ -521,6 +550,20 @@ mod tests {
             Path::new("libonnxruntime.so.1")
         );
         assert!(!p.join("libtbb.so").is_symlink());
+    }
+
+    #[test]
+    fn openvino_alone_needs_no_onnxruntime() {
+        let dir = TempDir::new().unwrap();
+        let p = &dir.0;
+        fs::write(p.join("libopenvino.so.2641"), b"ov").unwrap();
+        fs::write(p.join("libopenvino_c.so.2641"), b"c").unwrap();
+        normalise_links(p).unwrap();
+        assert_eq!(
+            fs::read_link(p.join("libopenvino_c.so")).unwrap(),
+            Path::new("libopenvino_c.so.2641")
+        );
+        assert!(!p.join("libonnxruntime.so").exists());
     }
 
     #[test]

@@ -2,7 +2,8 @@
 //!
 //! Prebuilt ONNX Runtime + OpenVINO wheels are preferred. A reviewed build
 //! recipe (`data/builds.toml`) is chosen only with `--build`, and only when its
-//! OpenVINO is newer than every prebuilt that fits the device.
+//! OpenVINO is newer than every prebuilt that fits the device. Callers that use
+//! OpenVINO directly, without ONNX Runtime, take Intel's `openvino` wheel alone.
 
 use crate::consensus::{self, Trust};
 use crate::data::{Build, Data};
@@ -14,13 +15,16 @@ use crate::version::Ver;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
-/// What gets installed: Intel's onnxruntime-openvino wheel, or ONNX Runtime
-/// compiled here from a recipe. For a build, `sha256` digests the recipe's
-/// inputs, since compiled output differs between toolchains.
+/// What gets installed: Intel's onnxruntime-openvino wheel, ONNX Runtime
+/// compiled here from a recipe, or the openvino wheel alone. For a build,
+/// `sha256` digests the recipe's inputs, since compiled output differs between
+/// toolchains.
 #[derive(Debug, Clone, Serialize)]
 pub struct Artifact {
     pub id: String,
-    pub onnxruntime: String,
+    /// `None` for an OpenVINO-only install.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub onnxruntime: Option<String>,
     pub url: String,
     pub sha256: String,
     pub trust: Trust,
@@ -34,6 +38,8 @@ pub struct Artifact {
 pub enum Kind {
     Wheel,
     Build,
+    /// Intel's `openvino` wheel, without ONNX Runtime.
+    Openvino,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -81,7 +87,7 @@ fn artifact(file: &PypiFile, data: &Data) -> Result<Artifact> {
     let (sha256, trust) = agreed(file, data)?;
     Ok(Artifact {
         id: file.ledger_id(),
-        onnxruntime: file.version.clone(),
+        onnxruntime: Some(file.version.clone()),
         url: file.url.clone(),
         sha256,
         trust,
@@ -149,7 +155,7 @@ fn build_artifact(build: &Build, data: &Data) -> Result<Artifact> {
             "build/onnxruntime-{}+openvino-{}",
             build.onnxruntime, build.openvino
         ),
-        onnxruntime: build.onnxruntime.clone(),
+        onnxruntime: Some(build.onnxruntime.clone()),
         url: format!(
             "https://github.com/{}/tree/{}",
             build.git_repo, build.git_commit
@@ -173,13 +179,56 @@ fn build_artifact(build: &Build, data: &Data) -> Result<Artifact> {
     })
 }
 
+/// The newest `openvino` release between the floor and the ceiling. Within a
+/// release, a wheel the ledger already records wins over a newer CPython tag:
+/// the libraries ovfetch takes are not Python-specific, and a recorded wheel
+/// installs as verified.
+pub fn pick_openvino(
+    wheels: &[PypiFile],
+    data: &Data,
+    need: &Ver,
+    ceiling: Option<&Ver>,
+) -> Option<(PypiFile, Ver)> {
+    let mut versions: Vec<&str> = wheels.iter().map(|w| w.version.as_str()).collect();
+    versions.dedup();
+    for v in versions {
+        let Some(ov) = Ver::parse(v) else {
+            continue;
+        };
+        if ov.minor() < *need {
+            break;
+        }
+        if ceiling.is_some_and(|c| ov.minor() > *c) {
+            continue;
+        }
+        let recorded = wheels
+            .iter()
+            .find(|w| w.version == v && data.ledger.get(&w.ledger_id()).is_some());
+        if let Some(w) = recorded.cloned().or_else(|| sources::pick_wheel(wheels, v)) {
+            return Some((w, ov));
+        }
+    }
+    None
+}
+
+/// What to install: ONNX Runtime with its OpenVINO EP, or OpenVINO alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Want {
+    OnnxRuntime { allow_build: bool },
+    OpenvinoOnly,
+}
+
 pub fn resolve(
     machine: &Machine,
     data: &Data,
     override_min: Option<&str>,
     ignore_driver: bool,
-    allow_build: bool,
+    want: Want,
 ) -> Result<Plan> {
+    let allow_build = match want {
+        Want::OnnxRuntime { allow_build } => allow_build,
+        Want::OpenvinoOnly => false,
+    };
     let floor = floor(machine, data, override_min);
     let mut warnings = Vec::new();
     let ceiling = if ignore_driver {
@@ -210,6 +259,31 @@ pub fn resolve(
              Upgrade the driver (github.com/intel/linux-npu-driver/releases), or pass --ignore-driver",
             machine.npu_driver.as_deref().unwrap_or("?")
         );
+    }
+
+    if want == Want::OpenvinoOnly {
+        let wheels = sources::pypi_wheels("openvino")?;
+        let Some((wheel, ov)) = pick_openvino(&wheels, data, &need, ceiling.as_ref()) else {
+            bail!(
+                "no openvino wheel fits this device: it needs OpenVINO >= {need}{}",
+                ceiling
+                    .as_ref()
+                    .map(|c| format!(" and <= {c} (NPU driver)"))
+                    .unwrap_or_default()
+            );
+        };
+        let mut artifact = artifact(&wheel, data)?;
+        artifact.onnxruntime = None;
+        artifact.kind = Kind::Openvino;
+        let npu = npu_requirements(machine, data, &ov, &mut warnings);
+        return Ok(Plan {
+            floor,
+            driver_ceiling: ceiling.map(|c| c.to_string()),
+            openvino: ov.to_string(),
+            artifact,
+            npu,
+            warnings,
+        });
     }
 
     // Wheels bundle ever-newer OpenVINO, so walk newest first and stop once
@@ -404,6 +478,41 @@ mod tests {
             "2026.6.0"
         );
         assert!(pick_build(&builds, &v("2026.7"), None).is_none());
+    }
+
+    fn ov_wheel(version: &str, build: &str, cp: &str) -> PypiFile {
+        PypiFile {
+            project: "openvino".into(),
+            version: version.into(),
+            filename: format!("openvino-{version}-{build}-{cp}-{cp}-manylinux_2_28_x86_64.whl"),
+            url: String::new(),
+            size: 0,
+            sha256: String::new(),
+            uploaded: String::new(),
+        }
+    }
+
+    #[test]
+    fn openvino_only_takes_the_newest_release_inside_the_bounds() {
+        let data = Data::load(None).unwrap();
+        // Newest first, as pypi_wheels returns them.
+        let wheels = [
+            ov_wheel("2026.5.0", "23000", "cp314"),
+            ov_wheel("2026.4.1", "22982", "cp314"),
+            ov_wheel("2026.4.1", "22982", "cp313"),
+            ov_wheel("2026.3.0", "22000", "cp314"),
+            ov_wheel("2025.3.0", "20000", "cp314"),
+        ];
+        let (w, ov) = pick_openvino(&wheels, &data, &v("2025.4"), Some(&v("2026.4"))).unwrap();
+        assert_eq!(ov, v("2026.4.1"));
+        // cp313 is the one the ledger records, so it beats the newer cp314.
+        assert!(w.filename.contains("cp313"), "{}", w.filename);
+        let (w, _) = pick_openvino(&wheels, &data, &v("2025.4"), None).unwrap();
+        assert_eq!(w.version, "2026.5.0");
+        let (_, ov) = pick_openvino(&wheels, &data, &v("2025.4"), Some(&v("2026.3"))).unwrap();
+        assert_eq!(ov, v("2026.3.0"));
+        assert!(pick_openvino(&wheels, &data, &v("2026.6"), None).is_none());
+        assert!(pick_openvino(&wheels[4..], &data, &v("2025.4"), None).is_none());
     }
 
     #[test]

@@ -10,7 +10,9 @@ use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 
 /// The lowest release worth tracking; older wheels predate OpenVINO being bundled.
-const TRACKED: &[(&str, &str)] = &[("onnxruntime-openvino", "1.22")];
+/// PyPI projects whose wheels `discover` records, and the oldest version kept.
+/// `openvino` alone serves `install --openvino-only` and every recipe's input.
+const TRACKED: &[(&str, &str)] = &[("onnxruntime-openvino", "1.22"), ("openvino", "2025.4")];
 const NPU_DRIVER_REPO: &str = "intel/linux-npu-driver";
 
 /// Kernel `PCI_DEVICE_ID_*` suffix to the name Intel's driver notes use.
@@ -260,18 +262,30 @@ pub fn discover(data: &mut Data) -> Result<String> {
             // A new release still has to clear the same agreement bar as an install.
             let (digest, _) =
                 consensus::agree(&id, &sources::pypi_claims(&w, &pages), &data.ledger)?;
-            let needle = format!("onnxruntime {}", w.version);
-            let release = intel
-                .iter()
-                .find(|r| r.body.to_lowercase().contains(&needle));
+            // Only onnxruntime-openvino wheels have an intel/onnxruntime release to match.
+            let origin = if *project == "onnxruntime-openvino" {
+                let needle = format!("onnxruntime {}", w.version);
+                match intel
+                    .iter()
+                    .find(|r| r.body.to_lowercase().contains(&needle))
+                {
+                    Some(r) => format!(", Intel release [{}]({})", r.tag, r.url),
+                    None => format!(
+                        ", **no {INTEL_ORT_REPO} release mentions ONNX Runtime {}; check before merging**",
+                        w.version
+                    ),
+                }
+            } else {
+                String::new()
+            };
             changes.push(format!(
-                "- ledger: `{id}` = `{digest}`, uploaded {}, {}{}",
+                "- ledger: `{id}` = `{digest}`, uploaded {}{origin}{}",
                 w.uploaded,
-                match release {
-                    Some(r) => format!("Intel release [{}]({})", r.tag, r.url),
-                    None => format!("**no {INTEL_ORT_REPO} release mentions ONNX Runtime {}; check before merging**", w.version),
-                },
-                if has_provenance { ", PyPI provenance published" } else { "" }
+                if has_provenance {
+                    ", PyPI provenance published"
+                } else {
+                    ""
+                }
             ));
             data.ledger.list.push(Entry {
                 id,
