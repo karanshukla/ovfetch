@@ -1,8 +1,13 @@
 # ovfetch
 
-Tell it "install the OpenVINO build this machine's Intel NPU needs" and it works out which one, downloads it, and refuses to install anything whose hash it cannot get independent sources to agree on.
+`ovfetch` finds and installs the OpenVINO-enabled ONNX Runtime build that fits
+an Intel NPU. It checks artifact hashes against multiple independent sources
+and a built-in ledger before installing anything.
 
-```
+For example, `ovfetch resolve` reports a plan without downloading or installing
+anything:
+
+```text
 $ ovfetch resolve --min-openvino 2025.1
 floor:    2025.1 (--min-openvino)
 ceiling:  2026.4 (newest known to compile on the installed NPU driver)
@@ -11,59 +16,110 @@ download: https://files.pythonhosted.org/packages/.../onnxruntime_openvino-1.24.
 sha256:   2c3bb73e68ac27f4891af8a595c1faf574ec68b772e6583c90a0b997a1822782
 ```
 
-It exists because [vinoAuthFace](https://github.com/karanshukla/vinoAuthFace) needs ONNX Runtime with the OpenVINO execution provider, and the answer to "which version" depends on the NPU, its driver, and what Intel has actually published. Working that out by hand every time is the job this replaces, for people and for AI agents alike (`resolve --json` is the API).
+The URL is shortened here for readability. `ovfetch` exists because
+[vinoAuthFace](https://github.com/karanshukla/vinoAuthFace) needs ONNX Runtime
+with the OpenVINO execution provider. Which version to use depends on the NPU,
+its driver, and what Intel has published. `resolve --json` provides the same
+plan as machine-readable output for scripts and AI agents.
 
-## What it picks
-
-Two bounds, and the newest prebuilt build between them:
-
-| Bound | Where it comes from |
-|---|---|
-| **Floor** | The NPU's PCI ID, mapped to the first Intel NPU driver release verified on that platform and the OpenVINO it paired with. A human-tested floor can be pinned over it. |
-| **Ceiling** | The installed NPU driver: the newest OpenVINO known to work with it, which is Intel's pairing for that release unless a newer one has been measured. Past it is untested rather than known to fail, and ovfetch stays below it anyway. |
-
-No NPU, no bounds: the newest build wins.
-
-Both bounds are deliberately pessimistic. Measured 2026-09-28 on Wildcat Lake, drivers 1.32.0 and 1.35.0 each compiled and ran a small test model on every OpenVINO from 2025.0 to 2026.4, and whisper-small.en's full pipeline on 2026.4, so neither bound has been seen to fail; the older versions were not tried with a real model. What did fail was a driver without its compiler: Fedora's 1.32.0 rpm ships none, and every `compile_model` then returns `ZE_RESULT_ERROR_UNSUPPORTED_FEATURE`, which looks like a version mismatch and is not one. `detect` checks for the compiler library the installed driver actually loads, since the name changed between 1.32 and 1.35.
-
-**It prefers prebuilt builds, and compiles only when asked.** If no prebuilt build fits, it stops and says which bound is in the way. An NPU that is newer than the data (no known floor) is refused too, rather than guessed at. When a reviewed recipe in `data/builds.toml` offers a newer OpenVINO than every prebuilt that fits, `resolve` says so, and `--build` compiles it (see [Local builds](#local-builds)).
-
-It installs into its own prefix and never touches the distro's OpenVINO, driver, or compiler. It will not replace a newer install in that prefix with an older one unless you pass `--allow-downgrade`.
-
-## Usage
+## Quick start
 
 ```bash
-ovfetch detect                                   # NPU/GPU, driver, compiler, platform bounds; offline
-ovfetch resolve [--json]                         # what it would install, hashes checked, nothing downloaded
-sudo ovfetch install --prefix /usr/local/lib/face-auth/openvino    # download, verify, install
-ovfetch verify --prefix /usr/local/lib/face-auth/openvino          # re-hash an install against its SHA256SUMS
-# install skips the download when the prefix already holds the resolved build; --force reinstalls
+cargo install ovfetch --locked
+ovfetch detect
+ovfetch resolve
+sudo ovfetch install --prefix /usr/local/lib/face-auth/openvino
+ovfetch verify --prefix /usr/local/lib/face-auth/openvino
 ```
 
-`--openvino-only` installs OpenVINO without ONNX Runtime (see [Without ONNX Runtime](#without-onnx-runtime)). `--min-openvino 2026.2` overrides the floor. `--ignore-driver` lifts the ceiling, at your own risk.
+`detect` works offline. `resolve` checks hashes but does not download anything.
+`install` downloads and installs into the specified prefix; it does not modify
+the system's OpenVINO, driver, or compiler. If the prefix already contains the
+resolved build, installation is skipped. Use `--force` to reinstall.
+
+## Choosing a build
+
+`ovfetch` prefers prebuilt builds and selects the newest one within two bounds:
+
+| Bound | How it is determined |
+|---|---|
+| **Floor** | The NPU's PCI ID maps to the first Intel NPU driver release verified for that platform and the OpenVINO version paired with it. A human-tested floor can override this value. |
+| **Ceiling** | The installed NPU driver maps to the newest OpenVINO known to work with it. This is Intel's pairing for that driver release unless a newer version has been measured. Versions above the ceiling are untested, not known to fail. |
+
+Without an NPU, there are no bounds, so `ovfetch` selects the newest known
+build.
+
+The bounds are deliberately cautious. Measurements on Wildcat Lake on
+2026-09-28 found that drivers 1.32.0 and 1.35.0 could compile and run a small
+test model on every OpenVINO version from 2025.0 through 2026.4. The full
+whisper-small.en pipeline was also tested on 2026.4; older versions were not
+tested with a real model.
+
+One failure was caused by a missing compiler, not an OpenVINO version mismatch:
+Fedora's driver 1.32.0 RPM does not include the compiler, and
+`compile_model` returns `ZE_RESULT_ERROR_UNSUPPORTED_FEATURE` without it.
+Because the compiler library name changed between driver versions 1.32 and
+1.35, `detect` checks for the library loaded by the installed driver.
+
+If no prebuilt build fits, `ovfetch` stops and reports which bound is blocking
+it. It also refuses an NPU whose platform is not yet in its data rather than
+guessing. When a reviewed recipe in `data/builds.toml` offers a newer OpenVINO
+version than any fitting prebuilt, `resolve` reports the recipe. Pass `--build`
+to compile and install it; see [Local builds](#local-builds).
+
+Useful options:
+
+- `--openvino-only` installs OpenVINO without ONNX Runtime; see
+  [Without ONNX Runtime](#without-onnx-runtime).
+- `--min-openvino VERSION` sets a higher minimum OpenVINO version.
+- `--ignore-driver` allows a version newer than the driver's known pairing.
+  Use this only if you accept the risk.
+- `--allow-unverified` lets `install` accept an artifact that sources agree on
+  but the ledger has not recorded.
+- `--allow-downgrade` lets `install` replace a newer version already installed
+  in the prefix.
 
 ## Local builds
 
-Intel's onnxruntime-openvino wheels lag OpenVINO itself: as of 2026-10-12 the newest bundles 2025.4.1 while OpenVINO is at 2026.4.1. Two programs on one NPU running different OpenVINO releases is a real failure, not a style issue: an NPU fault resets the device for every process using it. So ovfetch can compile ONNX Runtime against a newer OpenVINO, without giving up being the one place the version and its provenance come from.
+Intel's `onnxruntime-openvino` wheels can lag behind OpenVINO itself. As of
+2026-10-12, the newest wheel bundled OpenVINO 2025.4.1, while OpenVINO was at
+2026.4.1. Running different OpenVINO releases on the same NPU can cause a
+device fault that resets the NPU for every process using it. Local builds let
+`ovfetch` compile ONNX Runtime against a newer OpenVINO while keeping version
+selection and provenance in one place.
 
 ```bash
-ovfetch resolve --build                                        # the recipe, its pinned inputs, nothing built
-ovfetch install --build --prefix ~/.local/lib/app/ort          # compile, then install like any other build
+ovfetch resolve --build
+ovfetch install --build --prefix ~/.local/lib/app/ort
 ```
 
-A recipe in `data/builds.toml` pins every input, and `install --build` checks each one before it compiles:
+The first command shows the recipe and its pinned inputs without building.
+The second compiles and installs the selected build.
 
-| Input | How it is checked |
+Recipes in `data/builds.toml` pin each input. Before compiling, `install
+--build` checks:
+
+| Input | Check |
 |---|---|
-| ONNX Runtime source | Cloned at the recipe's tag, which must resolve to its pinned commit (GitHub is asked at resolve time, and the clone's `HEAD` must match). A tree with local changes is refused. |
-| OpenVINO | The PyPI `openvino` wheel, with its headers, CMake config and libraries. It goes through the same source agreement and ledger as every other artifact, so the OpenVINO installed is byte for byte the one Python programs on the machine run. |
-| Build flags | Part of the recipe. |
+| ONNX Runtime source | The recipe's tag must resolve to its pinned commit. `resolve` checks the tag with GitHub, and the cloned source must have the same commit at `HEAD`. Local changes to the checkout are refused. |
+| OpenVINO | The PyPI `openvino` wheel, including its headers, CMake configuration, and libraries, is checked against the same sources and ledger as other artifacts. This ensures the build uses the same OpenVINO files as Python programs on the machine. |
+| Build flags | The flags are part of the reviewed recipe. |
 
-The plan's `sha256` for a build is a digest of those inputs, not of the output: compiled libraries differ between compilers, so the output cannot be pinned in the ledger. The lock records the compiler and CMake that built it, and `SHA256SUMS` covers the installed files as usual, so `verify` works the same. Every installed library must search only `$ORIGIN` for its dependencies, so nothing can load from the build tree later. The build tree is executed and installed from, so `--build` refuses a build directory that is not owned by the user running ovfetch or that anyone else can write, and runs git with system, global and hook config ignored.
+For a local build, the plan's `sha256` covers the recipe inputs, not the
+compiled output: output can differ between compilers. The lock records the
+compiler and CMake versions used, and `SHA256SUMS` covers the installed files,
+so `verify` works as it does for prebuilt builds. Installed libraries must
+search only `$ORIGIN` for dependencies, preventing them from loading libraries
+from the build tree later.
 
-What it does not cover: ONNX Runtime's CMake dependencies are downloaded by CMake, not ovfetch, so they are outside the host allowlist below. CMake checks each against the hash in the pinned source's `cmake/deps.txt`, which is SHA-1.
+The build tree is used to compile and install the software. For that reason,
+`--build` refuses a build directory that is not owned by the current user or
+that another user can write to. It also runs Git with system, global, and hook
+configuration ignored.
 
-It needs git, cmake, ninja, python3 and a C++ compiler, 17 minutes with `--jobs 3` on a Dell XPS 13 (Core 5 320, measured 2026-10-12), and several GB under `~/.cache/ovfetch/build` (`--build-dir`). The clone and the OpenVINO wheel are kept to save downloads, but the clone is re-checked and the wheel re-hashed and re-extracted on every run, and the build itself always starts clean: compiled objects from an earlier run cannot be verified. `--jobs` defaults to half the CPUs; ONNX Runtime's compile is memory-hungry.
+ONNX Runtime's CMake configuration downloads some dependencies directly, so
+those downloads are outside `ovfetch`'s host allowlist. CMake checks them
+against SHA-1 hashes in the pinned source's `cmake/deps.txt`.
 
 ## Without ONNX Runtime
 
@@ -76,20 +132,45 @@ ovfetch install --openvino-only --prefix ~/.local/lib/app/openvino
 
 This installs Intel's PyPI `openvino` wheel alone: the newest OpenVINO between the floor and the ceiling, through the same source agreement and ledger, and never a compile. It is the same library set `--build` takes from that wheel (runtime, C API, CPU/GPU/NPU/AUTO/HETERO plugins, ONNX frontend, TBB), 139 MB, installed in 17 seconds on a Dell XPS 13 (Core 5 320, measured 2026-10-18). Within a release, a wheel the ledger already records is preferred over a newer CPython tag; the libraries are the same build, and a recorded one installs as verified. The lock has no `artifact.onnxruntime`, and `artifact.kind` is `openvino`.
 
-## How it decides a hash is trustworthy
+Building requires Git, CMake, Ninja, Python 3, and a C++ compiler. On a Dell
+XPS 13 (Core 5 320), a build with `--jobs 3` took 17 minutes (measured
+2026-10-12) and used several gigabytes under `~/.cache/ovfetch/build`. Use
+`--build-dir` to change the build directory. Source checkouts and the OpenVINO
+wheel are cached, but the checkout is re-checked and the wheel re-hashed and
+re-extracted on each run. Each build starts clean because compiled objects
+from earlier runs cannot be verified. By default, `--jobs` uses half the
+available CPUs; ONNX Runtime compilation can use substantial memory.
 
-1. **PyPI plus two independent mirrors** each state the wheel's sha256. At least two different hosts must answer, so pypi.org alone is never enough, and every one that answers must agree. One disagreement aborts the install and prints every source's claim.
-2. **The ledger** (`data/ledger.toml`) records the hash of every artifact the first time it was seen, and is compiled into the binary. A published file's hash must never change, so a mismatch aborts even when every source agrees.
-3. **The bytes** come from pypi.org, falling back to a mirror only if PyPI is unreachable, and are hashed as they stream. They must match the agreed hash.
-4. **The network** is HTTPS-only to a fixed list of hosts, re-checked after redirects. TLS roots are compiled in (rustls), so a spoofed DNS answer still needs a valid certificate for the real host.
+## Artifact verification
 
-Something every source agrees on but the ledger has never recorded is *unverified*, and `install` refuses it without `--allow-unverified`.
+Before installation, `ovfetch` checks that the artifact hash is trustworthy:
 
-The mirrors catch a tampered CDN edge or a bad mirror, but they copy PyPI, so they cannot catch a compromise at PyPI itself. The ledger is what covers that.
+1. **Independent sources agree.** PyPI and two independent mirrors report the
+   wheel's SHA-256 hash. At least two different hosts must respond, and every
+   responding source must agree. A disagreement aborts the install and shows
+   each source's claim.
+2. **The ledger matches.** `data/ledger.toml` records each artifact's hash the
+   first time it is seen and is compiled into the binary. A changed hash is
+   rejected even if all current sources agree.
+3. **The downloaded bytes match.** `ovfetch` downloads from PyPI, falling back
+   to a mirror only when PyPI is unreachable. It hashes the bytes as they
+   arrive and rejects a mismatch.
+4. **The connection is restricted.** Downloads use HTTPS to a fixed list of
+   hosts. Hosts are checked again after redirects, and TLS roots are compiled
+   in through rustls.
 
-## As a library
+An artifact that all sources agree on but that is not in the ledger is
+*unverified*. `install` rejects it unless you pass `--allow-unverified`.
 
-The offline half is a library too. Without the default `cli` feature it builds with no network crates (anyhow, serde, and toml only) and never downloads anything:
+Mirrors help detect a tampered CDN edge or a bad mirror, but they copy PyPI and
+cannot detect a compromise of PyPI itself. The ledger provides protection
+against that case.
+
+## Using ovfetch as a library
+
+The offline functionality is also available as a library. Without the default
+`cli` feature, the crate has no network dependencies (only `anyhow`, `serde`,
+and `toml`) and does not download anything:
 
 ```toml
 ovfetch = { version = "0.2", default-features = false }
@@ -99,40 +180,60 @@ ovfetch = { version = "0.2", default-features = false }
 let data = ovfetch::data::Data::load(None)?;
 let machine = ovfetch::detect::machine();
 let status = ovfetch::status::status(&machine, &data);
-// status.warnings: missing NPU driver or compiler, a driver older than the platform needs, an NPU the data does not know
+// status.warnings: missing NPU driver or compiler, an old driver, or an unknown NPU
 ```
 
 ## Keeping the data current
 
-Two scheduled workflows, so nobody maintains version tables by hand:
+Scheduled workflows maintain the version and platform data:
 
-- **Discover** (weekly) records new onnxruntime-openvino wheels once they have been public for 7 days, each linked to Intel's matching intel/onnxruntime release so review means checking it lines up with a real release. It also flags the day PyPI starts publishing provenance for them, and records new NPU driver releases with their OpenVINO pairing and asset hashes, and new NPU PCI IDs from the kernel's `ivpu` driver. It opens a PR. Nothing reaches users until that PR is reviewed and a release is cut.
-- **Guard** (every PR) fails a PR from anyone but the owner that touches source, data, dependencies, or CI. It runs from main's copy, so a PR cannot edit it to pass, and only the owner can merge past it.
-- **Audit** (daily) re-checks every ledger hash against every source and spot-downloads a random few from a random mirror. Any change opens an issue.
+- **Discover** runs weekly. It records new `onnxruntime-openvino` wheels after
+  they have been public for seven days and links each to Intel's matching
+  `intel/onnxruntime` release. It also tracks `openvino` wheels from 2025.4 and
+  records new NPU driver releases, their OpenVINO pairing and asset hashes, and
+  new NPU PCI IDs from the kernel's `ivpu` driver. Discover opens a pull
+  request; changes reach users only after review and a release. It also flags
+  when PyPI starts publishing provenance for the `onnxruntime-openvino` wheels.
+- **Guard** runs on every pull request. It blocks changes to source, data,
+  dependencies, or CI from anyone but the owner. It runs from the copy on the
+  default branch, so a pull request cannot change the check to pass.
+- **Audit** runs daily. It rechecks every ledger hash against every source and
+  downloads a random sample from a random mirror. A detected change opens an
+  issue.
 
 ## Installing
+
+Install from crates.io:
 
 ```bash
 cargo install ovfetch --locked
 ```
 
-Or download the static binary from [Releases](https://github.com/karanshukla/ovfetch/releases) and verify it (below). The binary is the stronger option: its provenance is signed, while `cargo install` compiles whatever crates.io serves.
+Alternatively, download a static binary from
+[Releases](https://github.com/karanshukla/ovfetch/releases) and verify it as
+described below. The release binary is the stronger option: it has signed
+build provenance, while `cargo install` compiles the crates served by crates.io.
 
 ## Verifying a release
 
-Release binaries are static (musl) and carry signed build provenance:
+Release binaries are static (musl) and include signed build provenance:
 
 ```bash
 gh attestation verify ovfetch-x86_64-linux --repo karanshukla/ovfetch
 ```
 
-Release tags cannot be moved or deleted, and releases are immutable once published.
+Release tags cannot be moved or deleted, and published releases are immutable.
 
 ## Known limits
 
-- Only Intel's `onnxruntime-openvino` wheels are installed. As of 2026-09-27 the newest bundles OpenVINO 2025.4.1, so a platform with a 2026.x floor (Wildcat Lake) gets a refusal until Intel ships a newer one.
-- Floors derived from driver notes are only as good as Intel's "verified on" tables.
-- Linux x86_64 only, which is where Intel publishes these builds.
+- Prebuilt ONNX Runtime support is limited to Intel's `onnxruntime-openvino`
+  wheels. As of
+  2026-10-12, the newest wheel bundles OpenVINO 2025.4.1. A reviewed local
+  build recipe may support a newer version; without a fitting prebuilt or
+  recipe, `ovfetch` refuses to guess.
+- Floors derived from driver notes are only as reliable as Intel's "verified
+  on" tables.
+- Linux x86_64 only, where Intel publishes these builds.
 
 ## License
 

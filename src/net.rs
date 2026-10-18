@@ -219,7 +219,9 @@ pub fn remote_zip_names(url: &str, size: u64) -> Result<Vec<String>> {
     let reader = io::BufReader::with_capacity(1 << 20, RangeReader::new(url, size));
     let zip =
         zip::ZipArchive::new(reader).with_context(|| format!("reading zip index of {url}"))?;
-    Ok(zip.file_names().map(str::to_owned).collect())
+    zip.file_names()
+        .map(|name| Ok(name?.into_owned()))
+        .collect()
 }
 
 #[cfg(test)]
