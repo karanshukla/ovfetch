@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `--openvino-only` on `resolve` and `install`: Intel's `openvino` wheel alone, for programs that call OpenVINO without ONNX Runtime. It takes the newest OpenVINO that fits the device and never compiles, so they get 2026.4.1 in seconds instead of a 17-minute `--build`.
+- `ci discover` records `openvino` wheels from 2025.4 on.
+
+### Changed
+
+- `resolve::resolve` takes a `Want` (`OnnxRuntime { allow_build }` or `OpenvinoOnly`) instead of `allow_build`.
+- `Artifact::onnxruntime` is an `Option`, absent from the lock for an OpenVINO-only install; `Kind` gains `Openvino`.
+
 ## [0.4.1] - 2026-10-13
 
 ### Fixed

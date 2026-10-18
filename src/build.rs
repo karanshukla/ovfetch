@@ -20,7 +20,7 @@ const TOOLS: &[&str] = &["git", "cmake", "ninja", "python3", "c++"];
 
 /// OpenVINO's runtime, plugins and the ONNX frontend the EP links: the same
 /// set Intel's onnxruntime-openvino wheel ships.
-fn is_openvino_runtime(file: &str) -> bool {
+pub(crate) fn is_openvino_runtime(file: &str) -> bool {
     let stem = file.split(".so").next().unwrap_or(file);
     matches!(
         stem,
@@ -217,7 +217,7 @@ pub fn stage(
 
     let root = opts.build_dir.join(format!(
         "onnxruntime-{}-openvino-{}-{}",
-        plan.artifact.onnxruntime,
+        plan.artifact.onnxruntime.as_deref().unwrap_or_default(),
         plan.openvino,
         &plan.artifact.sha256[..12]
     ));

@@ -69,6 +69,8 @@ to compile and install it; see [Local builds](#local-builds).
 
 Useful options:
 
+- `--openvino-only` installs OpenVINO without ONNX Runtime; see
+  [Without ONNX Runtime](#without-onnx-runtime).
 - `--min-openvino VERSION` sets a higher minimum OpenVINO version.
 - `--ignore-driver` allows a version newer than the driver's known pairing.
   Use this only if you accept the risk.
@@ -118,6 +120,17 @@ configuration ignored.
 ONNX Runtime's CMake configuration downloads some dependencies directly, so
 those downloads are outside `ovfetch`'s host allowlist. CMake checks them
 against SHA-1 hashes in the pinned source's `cmake/deps.txt`.
+
+## Without ONNX Runtime
+
+Programs that call OpenVINO directly (through its C API, the `openvino` crate, or `openvino-sys`) don't need ONNX Runtime, and so aren't held back by Intel's onnxruntime-openvino wheels:
+
+```bash
+ovfetch resolve --openvino-only
+ovfetch install --openvino-only --prefix ~/.local/lib/app/openvino
+```
+
+This installs Intel's PyPI `openvino` wheel alone: the newest OpenVINO between the floor and the ceiling, through the same source agreement and ledger, and never a compile. It is the same library set `--build` takes from that wheel (runtime, C API, CPU/GPU/NPU/AUTO/HETERO plugins, ONNX frontend, TBB), 139 MB, installed in 17 seconds on a Dell XPS 13 (Core 5 320, measured 2026-10-18). Within a release, a wheel the ledger already records is preferred over a newer CPython tag; the libraries are the same build, and a recorded one installs as verified. The lock has no `artifact.onnxruntime`, and `artifact.kind` is `openvino`.
 
 Building requires Git, CMake, Ninja, Python 3, and a C++ compiler. On a Dell
 XPS 13 (Core 5 320), a build with `--jobs 3` took 17 minutes (measured
@@ -176,11 +189,11 @@ Scheduled workflows maintain the version and platform data:
 
 - **Discover** runs weekly. It records new `onnxruntime-openvino` wheels after
   they have been public for seven days and links each to Intel's matching
-  `intel/onnxruntime` release. It also records new NPU driver releases, their
-  OpenVINO pairing and asset hashes, and new NPU PCI IDs from the kernel's
-  `ivpu` driver. Discover opens a pull request; changes reach users only after
-  review and a release. It also flags when PyPI starts publishing provenance
-  for these wheels.
+  `intel/onnxruntime` release. It also tracks `openvino` wheels from 2025.4 and
+  records new NPU driver releases, their OpenVINO pairing and asset hashes, and
+  new NPU PCI IDs from the kernel's `ivpu` driver. Discover opens a pull
+  request; changes reach users only after review and a release. It also flags
+  when PyPI starts publishing provenance for the `onnxruntime-openvino` wheels.
 - **Guard** runs on every pull request. It blocks changes to source, data,
   dependencies, or CI from anyone but the owner. It runs from the copy on the
   default branch, so a pull request cannot change the check to pass.
@@ -213,7 +226,8 @@ Release tags cannot be moved or deleted, and published releases are immutable.
 
 ## Known limits
 
-- Only Intel's `onnxruntime-openvino` prebuilt wheels are supported. As of
+- Prebuilt ONNX Runtime support is limited to Intel's `onnxruntime-openvino`
+  wheels. As of
   2026-10-12, the newest wheel bundles OpenVINO 2025.4.1. A reviewed local
   build recipe may support a newer version; without a fitting prebuilt or
   recipe, `ovfetch` refuses to guess.
