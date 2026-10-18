@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-18
+
+Breaking for library users: `resolve::resolve`, `Artifact` and `Kind` change (see Changed).
+
 ### Added
 
 - `--openvino-only` on `resolve` and `install`: Intel's `openvino` wheel alone, for programs that call OpenVINO without ONNX Runtime. It takes the newest OpenVINO that fits the device and never compiles, so they get 2026.4.1 in seconds instead of a 17-minute `--build`.
@@ -87,7 +91,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial release: resolve, verify and install prebuilt ONNX Runtime and OpenVINO for Intel NPUs.
 
-[Unreleased]: https://github.com/karanshukla/ovfetch/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/karanshukla/ovfetch/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/karanshukla/ovfetch/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/karanshukla/ovfetch/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/karanshukla/ovfetch/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/karanshukla/ovfetch/compare/v0.2.2...v0.3.0
