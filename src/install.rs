@@ -190,38 +190,66 @@ pub(crate) fn search_paths(elf: &[u8]) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// Strings for one `.dynamic` tag of a little-endian ELF64 file.
+/// Strings for one dynamic tag of a little-endian ELF64 file, read the way the
+/// loader reads them: the `PT_DYNAMIC` segment, with `DT_STRTAB` mapped to a
+/// file offset through the `PT_LOAD` segments. Section headers are not used;
+/// they can be stripped, or disagree with what the loader sees. `None` when
+/// the file is not such an ELF, or is malformed.
 fn dynamic_strings(elf: &[u8], tag: usize) -> Option<Vec<String>> {
     fn uint(b: &[u8], at: usize, len: usize) -> Option<usize> {
         let raw = b.get(at..at.checked_add(len)?)?;
         Some(raw.iter().rev().fold(0usize, |a, &x| (a << 8) | x as usize))
     }
+    let field = |at: usize, off: usize, len: usize| uint(elf, at.checked_add(off)?, len);
     if elf.get(..4)? != b"\x7fELF" || *elf.get(4)? != 2 || *elf.get(5)? != 1 {
         return None;
     }
-    let shoff = uint(elf, 0x28, 8)?;
-    let shentsize = uint(elf, 0x3a, 2)?;
-    let shnum = uint(elf, 0x3c, 2)?;
-    let section = |i: usize| shoff.checked_add(i.checked_mul(shentsize)?);
-    let mut out = Vec::new();
-    for i in 0..shnum {
-        let sh = section(i)?;
-        if uint(elf, sh + 4, 4)? != 6 {
-            continue; // not SHT_DYNAMIC
-        }
-        let (off, size) = (uint(elf, sh + 0x18, 8)?, uint(elf, sh + 0x20, 8)?);
-        let strtab = section(uint(elf, sh + 0x28, 4)?)?;
-        let str_off = uint(elf, strtab + 0x18, 8)?;
-        for d in (off..off.checked_add(size)?).step_by(16) {
-            if uint(elf, d, 8)? == tag {
-                let start = str_off.checked_add(uint(elf, d + 8, 8)?)?;
-                let name = elf.get(start..)?;
-                let end = name.iter().position(|&c| c == 0)?;
-                out.push(String::from_utf8(name[..end].to_vec()).ok()?);
-            }
+    let (phoff, phentsize, phnum) = (field(0, 0x20, 8)?, field(0, 0x36, 2)?, field(0, 0x38, 2)?);
+    // (p_type, p_offset, p_vaddr, p_filesz)
+    let headers = (0..phnum)
+        .map(|i| {
+            let at = phoff.checked_add(i.checked_mul(phentsize)?)?;
+            Some((
+                field(at, 0, 4)?,
+                field(at, 0x08, 8)?,
+                field(at, 0x10, 8)?,
+                field(at, 0x20, 8)?,
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    const PT_LOAD: usize = 1;
+    const PT_DYNAMIC: usize = 2;
+    let Some(&(_, dyn_off, _, dyn_size)) = headers.iter().find(|h| h.0 == PT_DYNAMIC) else {
+        return Some(Vec::new()); // statically linked: nothing to search
+    };
+    let file_offset = |addr: usize| {
+        headers
+            .iter()
+            .find(|h| h.0 == PT_LOAD && h.2 <= addr && addr - h.2 < h.3)
+            .and_then(|h| (addr - h.2).checked_add(h.1))
+    };
+    let (mut strtab, mut wanted) = (None, Vec::new());
+    for d in (dyn_off..dyn_off.checked_add(dyn_size)?).step_by(16) {
+        match field(d, 0, 8)? {
+            0 => break, // DT_NULL
+            5 => strtab = Some(field(d, 8, 8)?),
+            t if t == tag => wanted.push(field(d, 8, 8)?),
+            _ => {}
         }
     }
-    Some(out)
+    if wanted.is_empty() {
+        return Some(Vec::new());
+    }
+    let base = file_offset(strtab?)?;
+    wanted
+        .into_iter()
+        .map(|o| {
+            let name = elf.get(base.checked_add(o)?..)?;
+            let end = name.iter().position(|&c| c == 0)?;
+            // Lossy, so one odd byte can't hide the rest of the path.
+            Some(String::from_utf8_lossy(&name[..end]).into_owned())
+        })
+        .collect()
 }
 
 /// A library may only search its own directory: an absolute RUNPATH from a
@@ -232,7 +260,18 @@ pub(crate) fn check_search_paths(lib: &Path) -> Result<()> {
         if !path.is_file() || path.is_symlink() {
             continue;
         }
-        let paths = search_paths(&fs::read(&path)?).unwrap_or_default();
+        let bytes = fs::read(&path)?;
+        let name = e.file_name().to_string_lossy().into_owned();
+        let shared_object = name.ends_with(".so") || name.contains(".so.");
+        let paths = match search_paths(&bytes) {
+            Some(paths) => paths,
+            // Fail closed: what can't be read can't be shown to search only $ORIGIN.
+            None if shared_object || bytes.starts_with(b"\x7fELF") => bail!(
+                "{} is not an ELF64 library ovfetch can read, so its library search path can't be checked",
+                path.display()
+            ),
+            None => continue,
+        };
         if let Some(bad) = paths
             .iter()
             .find(|p| *p != "$ORIGIN" && !p.starts_with("$ORIGIN/"))
@@ -527,6 +566,99 @@ mod tests {
         assert_eq!(search_paths(&libc), Some(vec![]));
         let dir = TempDir::new().unwrap();
         fs::write(dir.0.join("libx.so"), &libc).unwrap();
+        check_search_paths(&dir.0).unwrap();
+    }
+
+    /// A minimal ELF64 shared object with one DT_RUNPATH and no section
+    /// headers, so only the program headers say where its dynamic strings are.
+    fn elf_with_runpath(runpath: &[u8]) -> Vec<u8> {
+        const BASE: u64 = 0x40_0000;
+        let (ph, dynamic, strtab) = (64u64, 64 + 2 * 56, 64 + 2 * 56 + 3 * 16);
+        let mut strings = vec![0u8];
+        strings.extend_from_slice(runpath);
+        strings.push(0);
+        let len = strtab + strings.len() as u64;
+        let mut f = vec![0u8; len as usize];
+        let put = |f: &mut Vec<u8>, at: u64, v: u64, n: usize| {
+            f[at as usize..at as usize + n].copy_from_slice(&v.to_le_bytes()[..n])
+        };
+        f[..4].copy_from_slice(b"\x7fELF");
+        f[4] = 2; // ELFCLASS64
+        f[5] = 1; // little-endian
+        f[6] = 1;
+        put(&mut f, 0x10, 3, 2); // ET_DYN
+        put(&mut f, 0x12, 62, 2); // x86-64
+        put(&mut f, 0x20, ph, 8);
+        put(&mut f, 0x36, 56, 2);
+        put(&mut f, 0x38, 2, 2);
+        // PT_LOAD over the whole file, PT_DYNAMIC over the three entries.
+        for (i, (ty, off, size)) in [(1u64, 0, len), (2, dynamic, 3 * 16)]
+            .into_iter()
+            .enumerate()
+        {
+            let at = ph + i as u64 * 56;
+            put(&mut f, at, ty, 4);
+            put(&mut f, at + 0x08, off, 8);
+            put(&mut f, at + 0x10, BASE + off, 8);
+            put(&mut f, at + 0x20, size, 8);
+        }
+        for (i, (tag, val)) in [(5u64, BASE + strtab), (29, 1), (0, 0)]
+            .into_iter()
+            .enumerate()
+        {
+            put(&mut f, dynamic + i as u64 * 16, tag, 8);
+            put(&mut f, dynamic + i as u64 * 16 + 8, val, 8);
+        }
+        f[strtab as usize..].copy_from_slice(&strings);
+        f
+    }
+
+    #[test]
+    fn runpath_is_read_from_program_headers() {
+        let elf = elf_with_runpath(b"$ORIGIN:/home/u/build/lib");
+        assert_eq!(
+            search_paths(&elf),
+            Some(vec!["$ORIGIN".into(), "/home/u/build/lib".into()])
+        );
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.0.join("libbuilt.so.1"), &elf).unwrap();
+        let err = check_search_paths(&dir.0).unwrap_err().to_string();
+        assert!(err.contains("/home/u/build/lib"), "{err}");
+    }
+
+    #[test]
+    fn an_origin_runpath_passes() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.0.join("libok.so"), elf_with_runpath(b"$ORIGIN/../lib")).unwrap();
+        check_search_paths(&dir.0).unwrap();
+    }
+
+    #[test]
+    fn a_non_utf8_runpath_is_still_checked() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.0.join("libodd.so"),
+            elf_with_runpath(b"\xff:/home/u/build"),
+        )
+        .unwrap();
+        assert!(check_search_paths(&dir.0).is_err());
+    }
+
+    #[test]
+    fn a_library_that_cannot_be_read_fails_closed() {
+        let dir = TempDir::new().unwrap();
+        let mut truncated = elf_with_runpath(b"/home/u/build");
+        truncated.truncate(100); // cuts through the program headers
+        fs::write(dir.0.join("libcut.so.2"), truncated).unwrap();
+        assert!(check_search_paths(&dir.0).is_err());
+
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.0.join("libnot.so"), b"not elf").unwrap();
+        assert!(check_search_paths(&dir.0).is_err());
+
+        // Not a library, not ELF: nothing to check.
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.0.join("plugins.xml"), b"<xml/>").unwrap();
         check_search_paths(&dir.0).unwrap();
     }
 
