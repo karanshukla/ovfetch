@@ -39,6 +39,9 @@ const MAX_REDIRECTS: usize = 5;
 const MAX_PAGE: u64 = 64 << 20;
 /// Cap on a downloaded file; the largest onnxruntime-openvino wheel is ~80 MiB.
 const MAX_DOWNLOAD: u64 = 512 << 20;
+/// ureq's body timeout is one budget for the whole body, not per read: 20
+/// minutes still fits the largest wheel at ~70 KiB/s.
+const RECV_BODY: Duration = Duration::from_secs(20 * 60);
 
 fn agent() -> ureq::Agent {
     // TLS is rustls with Mozilla's roots compiled in, so a spoofed DNS answer
@@ -50,8 +53,10 @@ fn agent() -> ureq::Agent {
         .max_redirects(0)
         .max_redirects_will_error(false)
         .http_status_as_error(false)
+        .timeout_resolve(Some(Duration::from_secs(10)))
         .timeout_connect(Some(Duration::from_secs(10)))
         .timeout_recv_response(Some(Duration::from_secs(60)))
+        .timeout_recv_body(Some(RECV_BODY))
         .user_agent(concat!("ovfetch/", env!("CARGO_PKG_VERSION")))
         .build()
         .into()
@@ -248,5 +253,14 @@ mod tests {
         );
         assert!(check_url(&resolve_location(from, "//evil.example/x")).is_err());
         assert!(check_url(&resolve_location(from, "http://pypi.org/x")).is_err());
+    }
+
+    #[test]
+    fn every_phase_of_a_request_is_bounded() {
+        let t = super::agent().config().timeouts();
+        assert!(t.resolve.is_some());
+        assert!(t.connect.is_some());
+        assert!(t.recv_response.is_some());
+        assert!(t.recv_body.is_some());
     }
 }
