@@ -494,7 +494,10 @@ mod tests {
 
     #[test]
     fn openvino_only_takes_the_newest_release_inside_the_bounds() {
-        let data = Data::load(None).unwrap();
+        let mut data = Data::load(None).unwrap();
+        data.ledger
+            .list
+            .retain(|e| !e.id.contains("2026.4.1-22982-cp314"));
         // Newest first, as pypi_wheels returns them.
         let wheels = [
             ov_wheel("2026.5.0", "23000", "cp314"),

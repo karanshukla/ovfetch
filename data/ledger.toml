@@ -149,3 +149,53 @@ first_seen = "2026-09-28"
 id = "pypi/openvino/openvino-2026.4.1-22982-cp313-cp313-manylinux_2_28_x86_64.whl"
 digest = "a9b637846c579d7b81b17b6585e0c7b1947574e8d13cf83d7307ce50cd2c352e"
 first_seen = "2026-10-12"
+
+[[artifact]]
+id = "pypi/openvino/openvino-2026.4.1-22982-cp314-cp314-manylinux_2_28_x86_64.whl"
+digest = "3631dd889dccf3d5087775948590a6609a662f90c24a9cf85bb4dfa0cdd7fd2f"
+first_seen = "2026-10-19"
+
+[[artifact]]
+id = "pypi/openvino/openvino-2026.4.0-22959-cp314-cp314-manylinux_2_28_x86_64.whl"
+digest = "5ac6b16b3072f4c5f20ab308db598098bcd1c346108e93f4b36d8548b95707bf"
+first_seen = "2026-10-19"
+
+[[artifact]]
+id = "pypi/openvino/openvino-2026.3.1-22476-cp314-cp314-manylinux_2_28_x86_64.whl"
+digest = "f9b2c14441258ef3ba7b8c5d0bc91d72c73e539f09c983b294abc61bb102b094"
+first_seen = "2026-10-19"
+
+[[artifact]]
+id = "pypi/openvino/openvino-2026.3.0-22451-cp314-cp314-manylinux_2_28_x86_64.whl"
+digest = "81a64aebd1a80da93bc9413b3ba9c93846c7cac57161cd4d7b287b354d77ad19"
+first_seen = "2026-10-19"
+
+[[artifact]]
+id = "pypi/openvino/openvino-2026.2.1-21919-cp314-cp314-manylinux_2_28_x86_64.whl"
+digest = "0ec716ddd84a63534613171d27c8657c8417734a1cccedeb40533e8673a12c6d"
+first_seen = "2026-10-19"
+
+[[artifact]]
+id = "pypi/openvino/openvino-2026.2.0-21903-cp314-cp314-manylinux_2_28_x86_64.whl"
+digest = "e822fded364c4935b3d852fb07c01c75c01a3e1adfa4c173cc9abee8c3c13695"
+first_seen = "2026-10-19"
+
+[[artifact]]
+id = "pypi/openvino/openvino-2026.1.0-21367-cp314-cp314-manylinux_2_28_x86_64.whl"
+digest = "727c5c7e74634d8bc8f736e6b26704fbcc7899a1b591a045819defff7da4f358"
+first_seen = "2026-10-19"
+
+[[artifact]]
+id = "pypi/openvino/openvino-2026.0.0-20965-cp314-cp314-manylinux_2_28_x86_64.whl"
+digest = "79ce4b5d7f3a7f84de878752d97620b84e0c4a8ee550fb3bca9fc36fe5669450"
+first_seen = "2026-10-19"
+
+[[artifact]]
+id = "pypi/openvino/openvino-2025.4.1-20426-cp314-cp314-manylinux2014_x86_64.whl"
+digest = "35498cb7fdae04bcb255637ed1162aa05afd266268effc6fb5b1acb3d56fd0a4"
+first_seen = "2026-10-19"
+
+[[artifact]]
+id = "pypi/openvino/openvino-2025.4.0-20398-cp314-cp314-manylinux2014_x86_64.whl"
+digest = "ac6cf3a21418fee22283326c5e9059e844a84c763651cd2faaaf1e033ebb72d0"
+first_seen = "2026-10-19"
