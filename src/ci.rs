@@ -13,7 +13,7 @@ use std::collections::HashMap;
 /// PyPI projects whose wheels `discover` records, and the oldest version kept.
 /// `openvino` alone serves `install --openvino-only` and every recipe's input.
 const TRACKED: &[(&str, &str)] = &[("onnxruntime-openvino", "1.22"), ("openvino", "2025.4")];
-const NPU_DRIVER_REPO: &str = "intel/linux-npu-driver";
+pub(crate) const NPU_DRIVER_REPO: &str = "intel/linux-npu-driver";
 
 /// Kernel `PCI_DEVICE_ID_*` suffix to the name Intel's driver notes use.
 /// A suffix missing here still lands in the PR, with an empty codename to fill.

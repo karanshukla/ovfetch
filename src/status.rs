@@ -142,7 +142,8 @@ pub fn compiler_warning(machine: &Machine) -> Option<String> {
         "the NPU driver names no compiler library ovfetch recognises; assuming it cannot compile models".into()
     } else {
         format!(
-            "the NPU driver cannot compile models: it loads {}, and that is not on the linker path",
+            "the NPU driver cannot compile models: it loads {}, and that is not on the linker path \
+             (`ovfetch npu install` fetches it)",
             needs.join(", or ")
         )
     })
@@ -184,6 +185,7 @@ mod tests {
             npu_driver: Some(driver.into()),
             npu_compiler: true,
             npu_compiler_needs: vec![],
+            npu_prefix: None,
         }
     }
 

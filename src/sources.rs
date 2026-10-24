@@ -243,25 +243,35 @@ pub fn github_releases(repo: &str) -> Result<Vec<GithubRelease>> {
             if r["draft"].as_bool().unwrap_or(false) || r["prerelease"].as_bool().unwrap_or(false) {
                 continue;
             }
-            out.push(GithubRelease {
-                tag: r["tag_name"].as_str().unwrap_or_default().to_owned(),
-                url: r["html_url"].as_str().unwrap_or_default().to_owned(),
-                body: r["body"].as_str().unwrap_or_default().to_owned(),
-                assets: r["assets"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|a| {
-                        Some(GithubAsset {
-                            name: a["name"].as_str()?.to_owned(),
-                            sha256: a["digest"].as_str()?.strip_prefix("sha256:")?.to_owned(),
-                        })
-                    })
-                    .collect(),
-            });
+            out.push(github_release_from(r));
         }
     }
     Ok(out)
+}
+
+pub fn github_release(repo: &str, tag: &str) -> Result<GithubRelease> {
+    Ok(github_release_from(&net::get_json(&format!(
+        "https://api.github.com/repos/{repo}/releases/tags/{tag}"
+    ))?))
+}
+
+fn github_release_from(r: &serde_json::Value) -> GithubRelease {
+    GithubRelease {
+        tag: r["tag_name"].as_str().unwrap_or_default().to_owned(),
+        url: r["html_url"].as_str().unwrap_or_default().to_owned(),
+        body: r["body"].as_str().unwrap_or_default().to_owned(),
+        assets: r["assets"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|a| {
+                Some(GithubAsset {
+                    name: a["name"].as_str()?.to_owned(),
+                    sha256: a["digest"].as_str()?.strip_prefix("sha256:")?.to_owned(),
+                })
+            })
+            .collect(),
+    }
 }
 
 pub fn github_raw(repo: &str, git_ref: &str, path: &str) -> Result<String> {

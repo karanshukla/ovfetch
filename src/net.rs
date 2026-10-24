@@ -14,6 +14,9 @@ const ALLOWED_HOSTS: &[&str] = &[
     "mirrors.aliyun.com",
     "api.github.com",
     "raw.githubusercontent.com",
+    // Release assets: github.com redirects each download to this host.
+    "github.com",
+    "release-assets.githubusercontent.com",
 ];
 
 /// Rejects anything but `https://<allowed host>/...`: no plain HTTP, no

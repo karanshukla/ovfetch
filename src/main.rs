@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use ovfetch::resolve::Want;
-use ovfetch::{ci, data, detect, install, resolve, sources, status};
+use ovfetch::{ci, data, detect, install, npu, resolve, sources, status};
 use std::path::PathBuf;
 
 /// Resolve, download, and verify the OpenVINO build this machine's Intel NPU needs.
@@ -75,9 +75,36 @@ enum Cmd {
         #[arg(long)]
         prefix: PathBuf,
     },
+    /// The NPU's user-space side: Intel's compiler, and optionally its driver.
+    #[command(subcommand)]
+    Npu(NpuCmd),
     /// Maintenance jobs run by this repo's CI.
     #[command(subcommand)]
     Ci(CiCmd),
+}
+
+#[derive(Subcommand)]
+enum NpuCmd {
+    /// Fetch the compiler the host's NPU driver loads (or, with --full, a
+    /// driver and its compiler) from Intel's release into a prefix. No root.
+    Install {
+        /// [default: ~/.local/lib/ovfetch-npu, which `detect` also reads]
+        #[arg(long)]
+        prefix: Option<PathBuf>,
+        /// Install the user-mode driver too, used instead of the host's.
+        #[arg(long)]
+        full: bool,
+        /// The driver release, e.g. 1.38.0 [default: the host driver's, or
+        /// with --full the newest verified on this NPU]
+        #[arg(long)]
+        driver: Option<String>,
+        /// Take GitHub's digest for a release the ledger has not recorded.
+        #[arg(long)]
+        allow_unverified: bool,
+        /// Reinstall even when --prefix already holds this release.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -228,6 +255,26 @@ fn main() -> Result<()> {
         Cmd::Verify { prefix } => {
             install::verify(&prefix)?;
             println!("{} matches its SHA256SUMS", prefix.display());
+        }
+        Cmd::Npu(NpuCmd::Install {
+            prefix,
+            full,
+            driver,
+            allow_unverified,
+            force,
+        }) => {
+            let prefix = prefix
+                .or_else(detect::default_npu_prefix)
+                .ok_or_else(|| anyhow::anyhow!("no HOME; pass --prefix"))?;
+            let opts = npu::Options {
+                driver,
+                full,
+                allow_unverified,
+                force,
+            };
+            let host = detect::machine_with(None);
+            let plan = npu::plan(&host, &data, &opts)?;
+            npu::install(&plan, &host, &prefix, &opts)?;
         }
         Cmd::Ci(CiCmd::Audit { sample }) => println!("{}", ci::audit(&data, sample)?),
         Cmd::Ci(CiCmd::Discover) => {
