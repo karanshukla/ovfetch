@@ -415,6 +415,71 @@ fn swap_in(staged: &Path, prefix: &Path, old_stem: &str) -> Result<()> {
     Ok(())
 }
 
+/// Refuses a prefix holding files ovfetch did not install, so replacing it
+/// never deletes someone else's.
+pub(crate) fn refuse_foreign(prefix: &Path) -> Result<()> {
+    if prefix.exists() {
+        let sums = fs::read_to_string(prefix.join(SUMS)).unwrap_or_default();
+        let foreign: Vec<String> = untracked(prefix, &sums)?
+            .into_iter()
+            .filter(|n| !is_replaced(n))
+            .collect();
+        if !foreign.is_empty() {
+            bail!(
+                "{} holds files ovfetch did not install and will not remove:\n  {}\n\
+                 Delete them, or pick an empty --prefix.",
+                prefix.display(),
+                foreign.join("\n  ")
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Where `prefix` will end up: a symlink is replaced where it points, not
+/// unlinked, and a relative path is made absolute.
+pub(crate) fn resolved(prefix: &Path) -> Result<PathBuf> {
+    match fs::canonicalize(prefix) {
+        Ok(p) => Ok(p),
+        Err(_) => Ok(std::path::absolute(prefix)?),
+    }
+}
+
+/// Checks the libraries staged in `lib`, records their sums and `lock`, and
+/// swaps them in for `prefix`. Returns the prefix as resolved.
+pub(crate) fn place(lib: &Path, prefix: &Path, lock: &serde_json::Value) -> Result<PathBuf> {
+    normalise_links(lib)?;
+    check_search_paths(lib)?;
+    write_sums(lib)?;
+    fs::write(lib.join(LOCK), serde_json::to_string_pretty(lock)?)?;
+    verify(lib)?;
+    let prefix = &resolved(prefix)?;
+    let parent = match prefix.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let name = prefix
+        .file_name()
+        .with_context(|| format!("{} names no directory", prefix.display()))?
+        .to_string_lossy();
+    let staged = TempDir::new_in(parent, &format!(".{name}.ovfetch-new"))?;
+    for e in fs::read_dir(lib)?.flatten() {
+        let dest = staged.0.join(e.file_name());
+        if e.path().is_symlink() {
+            symlink(fs::read_link(e.path())?, dest)?;
+        } else {
+            fs::copy(e.path(), dest)?;
+        }
+    }
+    let mode = fs::metadata(prefix).map_or(0o755, |m| m.permissions().mode());
+    fs::set_permissions(&staged.0, fs::Permissions::from_mode(mode))?;
+    verify(&staged.0)?;
+    swap_in(&staged.0, prefix, &format!(".{name}.ovfetch-old"))?;
+    verify(prefix)?;
+    Ok(prefix.clone())
+}
+
 pub struct Options {
     pub allow_unverified: bool,
     pub allow_downgrade: bool,
@@ -424,7 +489,7 @@ pub struct Options {
     pub jobs: usize,
 }
 
-fn installed_sha256(prefix: &Path) -> Option<String> {
+pub(crate) fn installed_sha256(prefix: &Path) -> Option<String> {
     let lock: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(prefix.join(LOCK)).ok()?).ok()?;
     Some(lock["artifact"]["sha256"].as_str()?.to_owned())
@@ -471,21 +536,7 @@ pub fn install(
         );
         return Ok(());
     }
-    if prefix.exists() {
-        let sums = fs::read_to_string(prefix.join(SUMS)).unwrap_or_default();
-        let foreign: Vec<String> = untracked(prefix, &sums)?
-            .into_iter()
-            .filter(|n| !is_replaced(n))
-            .collect();
-        if !foreign.is_empty() {
-            bail!(
-                "{} holds files ovfetch did not install and will not remove:\n  {}\n\
-                 Delete them, or pick an empty --prefix.",
-                prefix.display(),
-                foreign.join("\n  ")
-            );
-        }
-    }
+    refuse_foreign(prefix)?;
     let tmp = TempDir::new()?;
     let lib = tmp.0.join("lib");
     fs::create_dir_all(&lib)?;
@@ -545,40 +596,7 @@ pub fn install(
         }
     }
 
-    normalise_links(&lib)?;
-    check_search_paths(&lib)?;
-    write_sums(&lib)?;
-    fs::write(lib.join(LOCK), serde_json::to_string_pretty(&lock)?)?;
-    verify(&lib)?;
-
-    // A prefix given as a symlink is replaced where it points, not unlinked.
-    let prefix = &match fs::canonicalize(prefix) {
-        Ok(p) => p,
-        Err(_) => prefix.to_path_buf(),
-    };
-    let parent = match prefix.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    let name = prefix
-        .file_name()
-        .with_context(|| format!("{} names no directory", prefix.display()))?
-        .to_string_lossy();
-    let staged = TempDir::new_in(parent, &format!(".{name}.ovfetch-new"))?;
-    for e in fs::read_dir(&lib)?.flatten() {
-        let dest = staged.0.join(e.file_name());
-        if e.path().is_symlink() {
-            symlink(fs::read_link(e.path())?, dest)?;
-        } else {
-            fs::copy(e.path(), dest)?;
-        }
-    }
-    let mode = fs::metadata(prefix).map_or(0o755, |m| m.permissions().mode());
-    fs::set_permissions(&staged.0, fs::Permissions::from_mode(mode))?;
-    verify(&staged.0)?;
-    swap_in(&staged.0, prefix, &format!(".{name}.ovfetch-old"))?;
-    verify(prefix)?;
+    let prefix = &place(&lib, prefix, &lock)?;
     let what = match &plan.artifact.onnxruntime {
         Some(ort) => format!("ONNX Runtime {ort} + OpenVINO {}", plan.openvino),
         None => format!("OpenVINO {}", plan.openvino),

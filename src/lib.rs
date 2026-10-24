@@ -20,6 +20,8 @@ pub mod install;
 #[cfg(feature = "cli")]
 pub mod net;
 #[cfg(feature = "cli")]
+pub mod npu;
+#[cfg(feature = "cli")]
 pub mod resolve;
 #[cfg(feature = "cli")]
 pub mod sources;

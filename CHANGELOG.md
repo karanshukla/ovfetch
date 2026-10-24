@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Breaking for library users: `detect::Machine` has a new field, `npu_prefix`.
+
+### Added
+
+- `ovfetch npu install`: Intel's NPU compiler, or the user-mode driver and compiler, from a linux-npu-driver release into a prefix (default `~/.local/lib/ovfetch-npu`), checked against the ledger, with no dpkg and no root. It writes `ovfetch-preload.txt`, the libraries an app loads in order before OpenVINO opens the NPU. This replaces the `dpkg-deb -x` and `sudo install` steps for Fedora's compiler-less 1.32.0 driver.
+- `detect` counts the libraries in `~/.local/lib/ovfetch-npu`: a driver there replaces the host's, and a compiler there counts as found when the driver can reach it. `detect::machine_with` takes another prefix, or none.
+
+### Fixed
+
+- `install` no longer hangs forever on a DNS lookup that never answers: lookups time out after 10 seconds, and response bodies after 20 minutes.
+- `install` stages the new build next to the prefix and swaps it in with renames, so a failed copy no longer leaves a half-replaced prefix.
+
 ## [0.5.0] - 2026-10-18
 
 Breaking for library users: `resolve::resolve`, `Artifact` and `Kind` change (see Changed).

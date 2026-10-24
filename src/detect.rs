@@ -3,7 +3,12 @@
 use crate::version::Ver;
 use serde::Serialize;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Written by `ovfetch npu install`: the libraries an app loads by absolute
+/// path, in order, before OpenVINO looks for the NPU driver.
+pub const NPU_PRELOAD: &str = "ovfetch-preload.txt";
 
 #[derive(Debug, Serialize)]
 pub struct Device {
@@ -24,6 +29,17 @@ pub struct Machine {
     /// The compiler libraries the driver's binary names, as alternatives each
     /// of which needs every library in it.
     pub npu_compiler_needs: Vec<Vec<String>>,
+    /// An `ovfetch npu install` prefix whose libraries count as installed:
+    /// its driver replaces the host's, and its compiler is on the path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub npu_prefix: Option<String>,
+}
+
+/// Where `ovfetch npu install` puts the NPU driver and compiler by default.
+pub fn default_npu_prefix() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(|h| PathBuf::from(h).join(".local/lib/ovfetch-npu"))
 }
 
 /// The name a driver's binary carries, and the libraries that route loads.
@@ -41,6 +57,11 @@ const COMPILER_ROUTES: &[(&str, &[&str])] = &[
     ("libnpu_driver_compiler.so", &["libnpu_driver_compiler.so"]),
 ];
 
+/// The driver opens this one by absolute path from its own directory, not by
+/// soname (measured 2026-10-24 on 1.35.0 with `LD_DEBUG`), so a copy anywhere
+/// else, preloaded or on `LD_LIBRARY_PATH`, is never found.
+pub const COMPILER_BESIDE_DRIVER: &str = "libopenvino_intel_npu_compiler_loader.so";
+
 pub fn compiler_needs(driver: &[u8]) -> Vec<Vec<String>> {
     COMPILER_ROUTES
         .iter()
@@ -48,6 +69,19 @@ pub fn compiler_needs(driver: &[u8]) -> Vec<Vec<String>> {
         .map(|(_, libs)| libs.iter().map(|l| l.to_string()).collect())
         .collect()
 }
+
+/// Whether the Level Zero loader, which a driver in a prefix still needs from
+/// the host, is on the linker path.
+pub fn ze_loader_present() -> bool {
+    let ldconfig = Command::new("ldconfig")
+        .arg("-p")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    sonames(&ldconfig).contains(&ZE_LOADER)
+}
+
+pub const ZE_LOADER: &str = "libze_loader.so.1";
 
 /// Sonames `ldconfig -p` lists, the first word of each entry.
 pub fn sonames(ldconfig: &str) -> Vec<&str> {
@@ -64,7 +98,14 @@ pub fn compiler_present(needs: &[Vec<String>], sonames: &[&str]) -> bool {
         .any(|set| set.iter().all(|lib| sonames.contains(&lib.as_str())))
 }
 
+/// This machine, counting an NPU prefix at the default location.
 pub fn machine() -> Machine {
+    machine_with(default_npu_prefix().as_deref())
+}
+
+/// This machine, counting the NPU prefix at `npu_prefix` (if it holds a
+/// preload list). `None` looks at the host alone.
+pub fn machine_with(npu_prefix: Option<&Path>) -> Machine {
     let mut devices = Vec::new();
     for entry in fs::read_dir("/sys/bus/pci/devices")
         .into_iter()
@@ -96,11 +137,26 @@ pub fn machine() -> Machine {
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default();
-    let driver_path = ldconfig
-        .lines()
-        .find(|l| l.trim_start().starts_with("libze_intel_npu.so.1 "))
-        .and_then(|l| l.rsplit(' ').next())
-        .and_then(|p| fs::canonicalize(p).ok());
+    let npu_prefix = npu_prefix.filter(|p| p.join(NPU_PRELOAD).is_file());
+    let in_prefix: Vec<String> = npu_prefix
+        .and_then(|p| fs::read_dir(p).ok())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    let host_driver = || {
+        ldconfig
+            .lines()
+            .find(|l| l.trim_start().starts_with("libze_intel_npu.so.1 "))
+            .and_then(|l| l.rsplit(' ').next())
+            .and_then(|p| fs::canonicalize(p).ok())
+    };
+    let prefix_driver = npu_prefix
+        .filter(|_| in_prefix.iter().any(|n| n == "libze_intel_npu.so.1"))
+        .and_then(|p| fs::canonicalize(p.join("libze_intel_npu.so.1")).ok());
+    let has_prefix_driver = prefix_driver.is_some();
+    let driver_path = prefix_driver.or_else(host_driver);
     let npu_driver = driver_path
         .as_ref()
         .and_then(|p| {
@@ -114,12 +170,20 @@ pub fn machine() -> Machine {
         .and_then(|p| fs::read(p).ok())
         .map(|b| compiler_needs(&b))
         .unwrap_or_default();
-    let npu_compiler = compiler_present(&npu_compiler_needs, &sonames(&ldconfig));
+    let mut found = sonames(&ldconfig);
+    found.extend(
+        in_prefix
+            .iter()
+            .map(String::as_str)
+            .filter(|n| has_prefix_driver || *n != COMPILER_BESIDE_DRIVER),
+    );
+    let npu_compiler = compiler_present(&npu_compiler_needs, &found);
     Machine {
         devices,
         npu_driver,
         npu_compiler,
         npu_compiler_needs,
+        npu_prefix: npu_prefix.map(|p| p.display().to_string()),
     }
 }
 
