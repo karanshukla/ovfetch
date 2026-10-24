@@ -7,7 +7,7 @@ use crate::resolve::{Kind, Plan};
 use crate::version::Ver;
 use anyhow::{Context, Result, bail};
 use std::fs;
-use std::os::unix::fs::{DirBuilderExt, symlink};
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -21,13 +21,24 @@ impl TempDir {
     /// and copies what lands here into the prefix, so a path someone else
     /// created first in /tmp is an error, not something to reuse.
     pub(crate) fn new() -> Result<Self> {
+        Self::new_in(&std::env::temp_dir(), "ovfetch")
+    }
+
+    fn new_in(dir: &Path, stem: &str) -> Result<Self> {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.subsec_nanos();
-        let p = std::env::temp_dir().join(format!("ovfetch-{}-{nanos}", std::process::id()));
+        let p = dir.join(format!("{stem}-{}-{nanos}", std::process::id()));
         fs::DirBuilder::new()
             .mode(0o700)
             .create(&p)
             .with_context(|| format!("creating {}", p.display()))?;
         Ok(Self(p))
+    }
+
+    /// The path, no longer removed on drop.
+    fn keep(self) -> PathBuf {
+        let p = self.0.clone();
+        std::mem::forget(self);
+        p
     }
 }
 
@@ -372,6 +383,38 @@ fn is_replaced(name: &str) -> bool {
         || name == LOCK
 }
 
+/// Moves `staged` into place at `prefix`, keeping the old prefix whole until
+/// the new one is there: a failure leaves one install or the other, never a
+/// mix of both.
+fn swap_in(staged: &Path, prefix: &Path, old_stem: &str) -> Result<()> {
+    if !prefix.exists() {
+        return fs::rename(staged, prefix)
+            .with_context(|| format!("moving the new install to {}", prefix.display()));
+    }
+    let parent = prefix.parent().unwrap_or(Path::new("."));
+    // Not a guard: if the restore below fails, this is the only copy left.
+    let old = TempDir::new_in(parent, old_stem)?.keep();
+    fs::remove_dir(&old)?;
+    fs::rename(prefix, &old).with_context(|| format!("moving {} aside", prefix.display()))?;
+    if let Err(e) = fs::rename(staged, prefix) {
+        fs::rename(&old, prefix).with_context(|| {
+            format!(
+                "restoring {} from {} after: {e}",
+                prefix.display(),
+                old.display()
+            )
+        })?;
+        return Err(e).with_context(|| format!("moving the new install to {}", prefix.display()));
+    }
+    if let Err(e) = fs::remove_dir_all(&old) {
+        eprintln!(
+            "note: could not remove the old install at {}: {e}",
+            old.display()
+        );
+    }
+    Ok(())
+}
+
 pub struct Options {
     pub allow_unverified: bool,
     pub allow_downgrade: bool,
@@ -508,20 +551,33 @@ pub fn install(
     fs::write(lib.join(LOCK), serde_json::to_string_pretty(&lock)?)?;
     verify(&lib)?;
 
-    fs::create_dir_all(prefix).with_context(|| format!("creating {}", prefix.display()))?;
-    for e in fs::read_dir(prefix)?.flatten() {
-        if is_replaced(&e.file_name().to_string_lossy()) {
-            fs::remove_file(e.path())?;
-        }
-    }
+    // A prefix given as a symlink is replaced where it points, not unlinked.
+    let prefix = &match fs::canonicalize(prefix) {
+        Ok(p) => p,
+        Err(_) => prefix.to_path_buf(),
+    };
+    let parent = match prefix.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let name = prefix
+        .file_name()
+        .with_context(|| format!("{} names no directory", prefix.display()))?
+        .to_string_lossy();
+    let staged = TempDir::new_in(parent, &format!(".{name}.ovfetch-new"))?;
     for e in fs::read_dir(&lib)?.flatten() {
-        let dest = prefix.join(e.file_name());
+        let dest = staged.0.join(e.file_name());
         if e.path().is_symlink() {
             symlink(fs::read_link(e.path())?, dest)?;
         } else {
             fs::copy(e.path(), dest)?;
         }
     }
+    let mode = fs::metadata(prefix).map_or(0o755, |m| m.permissions().mode());
+    fs::set_permissions(&staged.0, fs::Permissions::from_mode(mode))?;
+    verify(&staged.0)?;
+    swap_in(&staged.0, prefix, &format!(".{name}.ovfetch-old"))?;
     verify(prefix)?;
     let what = match &plan.artifact.onnxruntime {
         Some(ort) => format!("ONNX Runtime {ort} + OpenVINO {}", plan.openvino),
@@ -700,7 +756,6 @@ mod tests {
 
     #[test]
     fn temp_dir_is_private() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new().unwrap();
         let mode = fs::metadata(&dir.0).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
@@ -730,5 +785,47 @@ mod tests {
         );
         assert!(err.contains("libstray.so: not installed"));
         assert!(!err.contains("libonnxruntime"));
+    }
+
+    #[test]
+    fn a_swap_replaces_the_whole_prefix() {
+        let dir = TempDir::new().unwrap();
+        let (prefix, staged) = (dir.0.join("ort"), dir.0.join("staged"));
+        fs::create_dir(&prefix).unwrap();
+        fs::write(prefix.join("libopenvino.so.2026.3.0"), b"old").unwrap();
+        fs::create_dir(&staged).unwrap();
+        fs::write(staged.join("libopenvino.so.2026.4.1"), b"new").unwrap();
+        swap_in(&staged, &prefix, ".ort.ovfetch-old").unwrap();
+        let names: Vec<_> = fs::read_dir(&prefix)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(names, ["libopenvino.so.2026.4.1"]);
+        let left: Vec<_> = fs::read_dir(&dir.0)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(left, ["ort"]);
+    }
+
+    #[test]
+    fn a_failed_swap_keeps_the_old_prefix() {
+        let dir = TempDir::new().unwrap();
+        let prefix = dir.0.join("ort");
+        fs::create_dir(&prefix).unwrap();
+        fs::write(prefix.join("libopenvino.so.2026.3.0"), b"old").unwrap();
+        assert!(swap_in(&dir.0.join("missing"), &prefix, ".ort.ovfetch-old").is_err());
+        assert_eq!(
+            fs::read(prefix.join("libopenvino.so.2026.3.0")).unwrap(),
+            b"old"
+        );
+        let left: Vec<_> = fs::read_dir(&dir.0)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(left, ["ort"]);
     }
 }
