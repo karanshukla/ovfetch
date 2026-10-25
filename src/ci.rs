@@ -3,6 +3,7 @@
 
 use crate::consensus;
 use crate::data::{Data, Entry, NpuDriver, Platform};
+use crate::install::TempDir;
 use crate::net;
 use crate::sources::{self, PypiFile};
 use crate::version::Ver;
@@ -36,6 +37,11 @@ fn tracked_wheels(project: &str, min: &str) -> Result<Vec<PypiFile>> {
         .filter(|v| Ver::parse(v).is_some_and(|v| v >= min))
         .filter_map(|v| sources::pick_wheel(&wheels, v))
         .collect())
+}
+
+/// `items[n % len]`, or `None` when there is nothing to pick from.
+fn nth_wrapping<T>(items: &[T], n: usize) -> Option<&T> {
+    items.get(n.checked_rem(items.len())?)
 }
 
 /// Returns the markdown report; fails if any recorded hash changed.
@@ -118,19 +124,25 @@ pub fn audit(data: &Data, sample: usize) -> Result<String> {
     let start = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .subsec_nanos() as usize;
-    let tmp = std::env::temp_dir().join(format!("ovfetch-audit-{}", std::process::id()));
+    let dir = TempDir::new()?;
+    let tmp = dir.0.join("spot");
     for i in 0..sample.min(spot.len()) {
         let (file, want) = &spot[(start + i * 7919) % spot.len()];
         let page = pages.get(&file.project).cloned().unwrap_or_default();
         let urls = sources::pypi_download_urls(file, &page);
-        let url = &urls[(start / 3 + i) % urls.len()];
+        let Some(url) = nth_wrapping(&urls, start / 3 + i) else {
+            eprintln!(
+                "note: no source lists a download URL for {}",
+                file.ledger_id()
+            );
+            continue;
+        };
         match net::download(url, &tmp) {
             Ok(got) if got == *want => {}
             Ok(got) => problems.push(format!("- `{url}` served sha256 {got}, recorded {want}")),
             Err(err) => eprintln!("note: spot download of {url} failed: {err:#}"),
         }
     }
-    let _ = std::fs::remove_file(&tmp);
 
     let mut report = format!(
         "Audited {checked} recorded artifacts, spot-downloaded {}.\n",
@@ -407,6 +419,12 @@ pub fn discover(data: &mut Data) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn picking_from_no_urls_does_not_panic() {
+        assert_eq!(nth_wrapping::<String>(&[], 7), None);
+        assert_eq!(nth_wrapping(&["a", "b", "c"], 7), Some(&"b"));
+    }
 
     #[test]
     fn reads_platforms_and_openvino_from_driver_notes() {
