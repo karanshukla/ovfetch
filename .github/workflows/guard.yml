@@ -42,18 +42,20 @@ jobs:
 
           # Discover PRs (opened by this repo's own workflow on main) may add
           # releases to the ledger and update derived floors, but never edit or
-          # remove a recorded hash.
+          # remove a recorded hash. Anything that stops the ledger diff being
+          # read (an API error, or GitHub omitting the patch of a large diff)
+          # counts as not ok.
           discover_ok() {
             [ "$AUTHOR" = "github-actions[bot]" ] || return 1
-            local name="$1" status="$2"
+            local name="$1" status="$2" patch
             case "$name" in
               data/platforms.toml | data/npu_drivers.toml) [ "$status" = modified ] ;;
               data/ledger.toml)
                 [ "$status" = modified ] || return 1
-                gh api "repos/$REPO/pulls/$PR/files" --paginate \
-                  --jq '.[] | select(.filename == "data/ledger.toml") | .patch' \
-                  | grep -E '^-[^-]' && return 1
-                return 0 ;;
+                patch=$(gh api "repos/$REPO/pulls/$PR/files" --paginate \
+                  --jq '.[] | select(.filename == "data/ledger.toml") | .patch // "MISSING"') || return 1
+                [ -n "$patch" ] && [ "$patch" != MISSING ] || return 1
+                ! grep -qE '^-[^-]' <<<"$patch" ;;
               *) return 1 ;;
             esac
           }
