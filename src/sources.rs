@@ -32,7 +32,14 @@ impl PypiFile {
 
 /// Every non-yanked Linux x86_64 wheel for `project`, newest release first.
 pub fn pypi_wheels(project: &str) -> Result<Vec<PypiFile>> {
-    let json = net::get_json(&format!("https://pypi.org/pypi/{project}/json"))?;
+    wheels_from_json(
+        project,
+        &net::get_json(&format!("https://pypi.org/pypi/{project}/json"))?,
+    )
+}
+
+/// [`pypi_wheels`] over an already-fetched PyPI JSON response.
+fn wheels_from_json(project: &str, json: &serde_json::Value) -> Result<Vec<PypiFile>> {
     let releases = json["releases"]
         .as_object()
         .context("PyPI response has no releases")?;
@@ -402,6 +409,80 @@ mod tests {
                 .unwrap()
                 .filename
                 .contains("cp313")
+        );
+    }
+
+    #[test]
+    fn only_current_linux_x86_64_wheels_are_kept_newest_first() {
+        let file = |name: &str, yanked: bool| {
+            serde_json::json!({
+                "filename": name,
+                "url": format!("https://files.pythonhosted.org/{name}"),
+                "size": 10,
+                "yanked": yanked,
+                "digests": {"sha256": "ab".repeat(32)},
+                "upload_time_iso_8601": "2026-10-01T12:00:00.000Z",
+            })
+        };
+        let json = serde_json::json!({"releases": {
+            "1.9": [file("p-1.9-cp313-cp313-manylinux_2_28_x86_64.whl", false)],
+            "1.10": [
+                file("p-1.10-cp313-cp313-manylinux_2_28_x86_64.whl", false),
+                file("p-1.10-cp313-cp313-manylinux_2_28_aarch64.whl", false),
+                file("p-1.10-cp313-cp313-win_amd64.whl", false),
+                file("p-1.10.tar.gz", false),
+            ],
+            "1.11": [file("p-1.11-cp313-cp313-manylinux_2_28_x86_64.whl", true)],
+            "not-a-version": [file("p-x-cp313-cp313-manylinux_2_28_x86_64.whl", false)],
+        }});
+        let wheels = wheels_from_json("p", &json).unwrap();
+        let names: Vec<&str> = wheels.iter().map(|w| w.filename.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "p-1.10-cp313-cp313-manylinux_2_28_x86_64.whl",
+                "p-1.9-cp313-cp313-manylinux_2_28_x86_64.whl",
+            ]
+        );
+        assert_eq!(wheels[0].uploaded, "2026-10-01");
+        assert_eq!(wheels[0].sha256, "ab".repeat(32));
+        assert_eq!(wheels[0].ledger_id(), format!("pypi/p/{}", names[0]));
+
+        assert!(wheels_from_json("p", &serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn a_mirror_without_the_file_is_a_non_answer() {
+        let file = PypiFile {
+            project: "p".into(),
+            version: "1.0".into(),
+            filename: "p-1.0.whl".into(),
+            url: "https://files.pythonhosted.org/p-1.0.whl".into(),
+            size: 0,
+            sha256: "ab".repeat(32),
+            uploaded: String::new(),
+        };
+        let d = "cd".repeat(32);
+        let pages: MirrorPages = vec![
+            (
+                "https://m1.example/simple",
+                Ok(format!("<a href=\"../../f/p-1.0.whl#sha256={d}\">p</a>")),
+            ),
+            ("https://m2.example/simple", Ok("<html></html>".into())),
+            ("https://m3.example/simple", Err("timed out".into())),
+        ];
+        let claims = pypi_claims(&file, &pages);
+        assert_eq!(claims.len(), 4);
+        assert_eq!(claims[0].digest.as_deref(), Some(file.sha256.as_str()));
+        assert_eq!(claims[1].digest.as_deref(), Some(d.as_str()));
+        assert!(claims[2].digest.is_none() && claims[2].error.is_some());
+        assert_eq!(claims[3].error.as_deref(), Some("timed out"));
+        assert_eq!(
+            pypi_download_urls(&file, &pages),
+            [
+                "https://files.pythonhosted.org/p-1.0.whl",
+                "https://m1.example/f/p-1.0.whl"
+            ]
         );
     }
 }

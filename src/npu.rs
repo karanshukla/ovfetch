@@ -629,4 +629,86 @@ mod tests {
             Some(&needs[1])
         );
     }
+
+    fn npu_plan(mode: Mode, trust: Trust) -> Plan {
+        Plan {
+            version: "1.35.0".into(),
+            mode,
+            id: "github/intel/linux-npu-driver/v1.35.0/x.tar.gz".into(),
+            url: "http://not-allowed.invalid/x.tar.gz".into(),
+            sha256: "same".into(),
+            trust,
+        }
+    }
+
+    /// A prefix `npu install` left in `mode`, plus a file it did not write,
+    /// so an install that gets past the short-circuit stops at
+    /// `refuse_foreign` instead of reaching the network.
+    fn npu_prefix(mode: &str) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.0.join("libnpu_driver_compiler.so"), b"c").unwrap();
+        install::write_sums(&dir.0).unwrap();
+        fs::write(
+            dir.0.join("ovfetch.lock.json"),
+            serde_json::json!({"mode": mode, "artifact": {"sha256": "same"}}).to_string(),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn foreign(dir: &TempDir) -> &TempDir {
+        fs::write(dir.0.join("mine.txt"), b"x").unwrap();
+        dir
+    }
+
+    #[test]
+    fn an_unverified_driver_release_needs_the_flag() {
+        let prefix = TempDir::new().unwrap();
+        let p = npu_plan(Mode::Compiler, Trust::Unverified);
+        let err = install(&p, &host(Some("1.35.0")), &prefix.0, &opts(None, false)).unwrap_err();
+        assert!(err.to_string().contains("--allow-unverified"), "{err}");
+    }
+
+    #[test]
+    fn a_full_install_covers_a_request_for_the_compiler_alone() {
+        let prefix = npu_prefix("full");
+        foreign(&prefix);
+        let p = npu_plan(Mode::Compiler, Trust::Verified);
+        // The foreign file breaks verify, so it is not "already installed".
+        assert!(install(&p, &host(Some("1.35.0")), &prefix.0, &opts(None, false)).is_err());
+        fs::remove_file(prefix.0.join("mine.txt")).unwrap();
+        install(&p, &host(Some("1.35.0")), &prefix.0, &opts(None, false)).unwrap();
+    }
+
+    #[test]
+    fn a_compiler_install_does_not_cover_a_full_request() {
+        let prefix = npu_prefix("compiler");
+        let h = host(Some("1.35.0"));
+        install(
+            &npu_plan(Mode::Compiler, Trust::Verified),
+            &h,
+            &prefix.0,
+            &opts(None, false),
+        )
+        .unwrap();
+        // Past the short-circuit, a full install stops at the Level Zero
+        // loader check or the offline download; either way it is an error.
+        let full = npu_plan(Mode::Full, Trust::Verified);
+        assert!(install(&full, &h, &prefix.0, &opts(None, true)).is_err());
+    }
+
+    #[test]
+    fn a_host_that_finds_its_compiler_needs_nothing() {
+        let prefix = TempDir::new().unwrap();
+        let mut h = host(Some("1.35.0"));
+        h.npu_compiler = true;
+        install(
+            &npu_plan(Mode::Compiler, Trust::Verified),
+            &h,
+            &prefix.0.join("npu"),
+            &opts(None, false),
+        )
+        .unwrap();
+        assert!(!prefix.0.join("npu").exists());
+    }
 }
