@@ -37,12 +37,18 @@ jobs:
           test "$GITHUB_REF_NAME" = "v$version" || { echo "tag $GITHUB_REF_NAME, Cargo.toml $version" >&2; exit 1; }
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo test --locked
+      - run: cargo test --locked --target x86_64-unknown-linux-musl
       - name: Build
         run: |
           cargo build --release --locked --target x86_64-unknown-linux-musl
           mkdir dist
           cp target/x86_64-unknown-linux-musl/release/ovfetch dist/ovfetch-x86_64-linux
           (cd dist && sha256sum ovfetch-x86_64-linux > SHA256SUMS)
+      - name: Smoke-test the binary that ships
+        run: |
+          file dist/ovfetch-x86_64-linux | tee /dev/stderr | grep -q 'static'
+          test "$(dist/ovfetch-x86_64-linux --version)" = "ovfetch ${GITHUB_REF_NAME#v}"
+          dist/ovfetch-x86_64-linux detect | jq -e '.devices | type == "array"'
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist

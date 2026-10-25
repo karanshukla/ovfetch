@@ -86,6 +86,7 @@ jobs:
             echo
             echo "\`$AUTHOR\` changed paths that control what ovfetch trusts:"
             echo
+            # shellcheck disable=SC2016 # the backticks are markdown
             printf -- '- `%s`\n' "${flagged[@]}"
           } >> "$GITHUB_STEP_SUMMARY"
           printf '::error::%s changed protected path %s\n' "$AUTHOR" "${flagged[@]}"
