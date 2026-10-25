@@ -197,7 +197,7 @@ fn unpack_libs(data_tar_gz: &[u8], dest: &Path) -> Result<Vec<String>> {
                     .context("symlink without a target")?
                     .to_string_lossy()
                     .into_owned();
-                if target.contains('/') {
+                if target.contains('/') || matches!(target.as_str(), "" | "." | "..") {
                     bail!("{file} links outside its directory, to {target}");
                 }
                 symlink(target, &out)?;
@@ -489,6 +489,16 @@ mod tests {
         let data = tar_gz(|b| link(b, "usr/lib/x86_64-linux-gnu/libz.so.1", "/etc/shadow"));
         let dir = TempDir::new().unwrap();
         assert!(unpack_libs(&data, &dir.0).is_err());
+    }
+
+    #[test]
+    fn a_symlink_to_a_directory_is_refused() {
+        for target in [".", ".."] {
+            let data = tar_gz(|b| link(b, "usr/lib/x86_64-linux-gnu/libz.so.1", target));
+            let dir = TempDir::new().unwrap();
+            assert!(unpack_libs(&data, &dir.0).is_err(), "{target}");
+            assert!(fs::read_dir(&dir.0).unwrap().next().is_none());
+        }
     }
 
     #[test]

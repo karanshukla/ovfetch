@@ -91,7 +91,14 @@ pub(crate) fn unzip(
             dest.join(&rel)
         };
         fs::create_dir_all(out.parent().context("entry without a parent")?)?;
-        std::io::copy(&mut entry, &mut fs::File::create(&out)?)?;
+        // create_new: a second entry with the same name (or, flattened, the
+        // same file name) is an error rather than silently replacing the first.
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&out)
+            .with_context(|| format!("unpacking {name} to {}", out.display()))?;
+        std::io::copy(&mut entry, &mut file)?;
     }
     Ok(())
 }
@@ -770,6 +777,58 @@ mod tests {
             Path::new("libopenvino_c.so.2641")
         );
         assert!(!p.join("libonnxruntime.so").exists());
+    }
+
+    fn zip_of(entries: &[(&str, &[u8])]) -> TempDir {
+        use std::io::Write;
+        let dir = TempDir::new().unwrap();
+        let mut w = zip::ZipWriter::new(fs::File::create(dir.0.join("a.whl")).unwrap());
+        for (name, data) in entries {
+            w.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            w.write_all(data).unwrap();
+        }
+        w.finish().unwrap();
+        dir
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn unzip_never_writes_outside_dest() {
+        let zip = zip_of(&[
+            ("../../libup.so", b"x"),
+            ("/abs/libabs.so", b"x"),
+            ("onnxruntime/capi/libok.so", b"ok"),
+        ]);
+        let dest = zip.0.join("out");
+        fs::create_dir(&dest).unwrap();
+        unzip(&zip.0.join("a.whl"), &dest, |_| true, false).unwrap();
+        assert_eq!(names_in(&zip.0), ["a.whl", "out"]);
+        // `enclosed_name` keeps an absolute path, re-rooted under dest.
+        assert!(!Path::new("/abs/libabs.so").exists());
+        assert_eq!(
+            fs::read(dest.join("onnxruntime/capi/libok.so")).unwrap(),
+            b"ok"
+        );
+    }
+
+    #[test]
+    fn a_flattened_name_collision_is_an_error() {
+        let zip = zip_of(&[("a/libx.so", b"first"), ("b/libx.so", b"second")]);
+        let dest = zip.0.join("out");
+        fs::create_dir(&dest).unwrap();
+        let err = unzip(&zip.0.join("a.whl"), &dest, |_| true, true).unwrap_err();
+        assert!(format!("{err:#}").contains("b/libx.so"), "{err:#}");
+        assert_eq!(fs::read(dest.join("libx.so")).unwrap(), b"first");
     }
 
     #[test]
