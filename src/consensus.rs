@@ -23,6 +23,12 @@ fn host(source: &str) -> &str {
     rest.split('/').next().unwrap_or(rest)
 }
 
+/// 64 lowercase hex digits, the form every source and the ledger use.
+fn is_sha256(digest: Option<&str>) -> bool {
+    digest
+        .is_some_and(|d| d.len() == 64 && d.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+}
+
 /// The agreed digest, or an error naming every source when any disagree.
 pub fn agree(id: &str, claims: &[Claim], ledger: &Ledger) -> Result<(String, Trust)> {
     let answered: Vec<&Claim> = claims.iter().filter(|c| c.digest.is_some()).collect();
@@ -31,6 +37,13 @@ pub fn agree(id: &str, claims: &[Claim], ledger: &Ledger) -> Result<(String, Tru
             "note: {} did not answer for {id}: {}",
             c.source,
             c.error.as_deref().unwrap_or_default()
+        );
+    }
+    if let Some(c) = answered.iter().find(|c| !is_sha256(c.digest.as_deref())) {
+        bail!(
+            "{} gave {:?} as the sha256 of {id}, which is not a sha256. Nothing was installed.",
+            c.source,
+            c.digest.as_deref().unwrap_or_default()
         );
     }
     let hosts: HashSet<&str> = answered.iter().map(|c| host(&c.source)).collect();
@@ -75,7 +88,8 @@ mod tests {
     fn claim(source: &str, digest: Option<&str>) -> Claim {
         Claim {
             source: source.into(),
-            digest: digest.map(str::to_owned),
+            // Two hex digits stand for a whole digest, to keep the cases short.
+            digest: digest.map(|d| d.repeat(32)),
             error: digest.is_none().then(|| "down".into()),
         }
     }
@@ -84,7 +98,7 @@ mod tests {
         Ledger {
             list: vec![Entry {
                 id: "x".into(),
-                digest: digest.into(),
+                digest: digest.repeat(32),
                 first_seen: "2026-09-27".into(),
                 provenance: false,
             }],
@@ -100,7 +114,7 @@ mod tests {
         ];
         assert_eq!(
             agree("x", &claims, &ledger("aa")).unwrap(),
-            ("aa".into(), Trust::Verified)
+            ("aa".repeat(32), Trust::Verified)
         );
     }
 
@@ -153,5 +167,25 @@ mod tests {
             claim("https://mirrors.aliyun.com/pypi/simple", None),
         ];
         assert!(agree("x", &claims, &Ledger::default()).is_err());
+    }
+
+    #[test]
+    fn a_digest_that_is_not_a_sha256_aborts() {
+        for bad in ["", "aa", &"A".repeat(64), &"g".repeat(64), &"a".repeat(65)] {
+            let claims = [
+                Claim {
+                    source: "pypi.org/pypi JSON".into(),
+                    digest: Some(bad.to_owned()),
+                    error: None,
+                },
+                Claim {
+                    source: "https://m.example/simple".into(),
+                    digest: Some(bad.to_owned()),
+                    error: None,
+                },
+            ];
+            let err = agree("x", &claims, &Ledger::default()).unwrap_err();
+            assert!(err.to_string().contains("not a sha256"), "{bad:?}: {err}");
+        }
     }
 }
