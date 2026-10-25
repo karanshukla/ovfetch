@@ -293,3 +293,14 @@ fn main() -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_is_consistent() {
+        Cli::command().debug_assert();
+    }
+}

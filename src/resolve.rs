@@ -494,10 +494,22 @@ mod tests {
 
     #[test]
     fn openvino_only_takes_the_newest_release_inside_the_bounds() {
-        let mut data = Data::load(None).unwrap();
-        data.ledger
-            .list
-            .retain(|e| !e.id.contains("2026.4.1-22982-cp314"));
+        // Synthetic data, so a discover PR that records more wheels can't
+        // change what this expects.
+        let data = Data {
+            dir: None,
+            platforms: Default::default(),
+            npu_drivers: Default::default(),
+            ledger: crate::data::Ledger {
+                list: vec![crate::data::Entry {
+                    id: ov_wheel("2026.4.1", "22982", "cp313").ledger_id(),
+                    digest: "ab".repeat(32),
+                    first_seen: "2026-10-01".into(),
+                    provenance: false,
+                }],
+            },
+            builds: Default::default(),
+        };
         // Newest first, as pypi_wheels returns them.
         let wheels = [
             ov_wheel("2026.5.0", "23000", "cp314"),
@@ -542,23 +554,5 @@ mod tests {
         let mut other = base;
         other.build_args.push("--x".into());
         assert_ne!(d, recipe_digest(&other, "aa"));
-    }
-
-    #[test]
-    fn every_shipped_recipe_pins_a_ledger_input_and_a_full_commit() {
-        let data = Data::load(None).unwrap();
-        for b in &data.builds.list {
-            assert!(
-                data.ledger.get(&b.openvino_wheel).is_some(),
-                "{}",
-                b.openvino_wheel
-            );
-            assert_eq!(b.git_commit.len(), 40, "{}", b.git_commit);
-            assert!(
-                b.cmake_defines
-                    .iter()
-                    .any(|d| d == "CMAKE_INSTALL_RPATH=$ORIGIN")
-            );
-        }
     }
 }

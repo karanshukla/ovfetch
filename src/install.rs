@@ -53,9 +53,20 @@ impl Drop for TempDir {
 /// aborts rather than falling through: it means the bytes served differ from
 /// what every source agreed on.
 pub(crate) fn fetch(urls: &[String], sha256: &str, dest: &Path) -> Result<()> {
+    fetch_with(urls, sha256, dest, net::download)
+}
+
+/// [`fetch`] with the downloader passed in: it writes `url` to the path and
+/// returns the sha256 of what it wrote.
+fn fetch_with(
+    urls: &[String],
+    sha256: &str,
+    dest: &Path,
+    download: impl Fn(&str, &Path) -> Result<String>,
+) -> Result<()> {
     let mut last = None;
     for url in urls {
-        match net::download(url, dest) {
+        match download(url, dest) {
             Ok(got) if got == sha256 => return Ok(()),
             Ok(got) => bail!(
                 "{url} served bytes with sha256 {got}, but every source agreed on {sha256}. Aborting."
@@ -296,7 +307,7 @@ pub(crate) fn check_search_paths(lib: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_sums(dir: &Path) -> Result<()> {
+pub(crate) fn write_sums(dir: &Path) -> Result<()> {
     let mut names: Vec<String> = fs::read_dir(dir)?
         .flatten()
         .filter(|e| e.path().is_file() && !e.path().is_symlink())
@@ -845,5 +856,206 @@ mod tests {
             .map(|e| e.file_name())
             .collect();
         assert_eq!(left, ["ort"]);
+    }
+
+    #[test]
+    fn a_hash_mismatch_aborts_without_trying_the_next_mirror() {
+        let dir = TempDir::new().unwrap();
+        let tried = std::cell::RefCell::new(Vec::new());
+        let urls = ["https://a/x".to_owned(), "https://b/x".to_owned()];
+        let err = fetch_with(&urls, "good", &dir.0.join("x"), |url, _| {
+            tried.borrow_mut().push(url.to_owned());
+            Ok("tampered".into())
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("Aborting"), "{err}");
+        assert_eq!(*tried.borrow(), ["https://a/x"]);
+    }
+
+    #[test]
+    fn only_a_transport_error_falls_through_to_the_next_mirror() {
+        let dir = TempDir::new().unwrap();
+        let urls = ["https://a/x".to_owned(), "https://b/x".to_owned()];
+        let dl = |url: &str, _: &Path| match url {
+            "https://a/x" => bail!("connection refused"),
+            _ => Ok("good".to_owned()),
+        };
+        fetch_with(&urls, "good", &dir.0.join("x"), dl).unwrap();
+
+        let all_down = |url: &str, _: &Path| -> Result<String> { bail!("{url} is down") };
+        let err = fetch_with(&urls, "good", &dir.0.join("x"), all_down).unwrap_err();
+        assert_eq!(err.to_string(), "https://b/x is down");
+
+        let err = fetch_with(&[], "good", &dir.0.join("x"), all_down).unwrap_err();
+        assert!(err.to_string().contains("no source"), "{err}");
+    }
+
+    fn plan(openvino: &str, sha256: &str, trust: Trust) -> Plan {
+        use crate::resolve::{Artifact, Npu};
+        Plan {
+            floor: crate::status::Floor {
+                openvino: None,
+                reason: String::new(),
+            },
+            driver_ceiling: None,
+            openvino: openvino.into(),
+            artifact: Artifact {
+                id: "pypi/openvino/openvino-x.whl".into(),
+                onnxruntime: None,
+                // Refused by check_url, so a test that gets as far as a
+                // download fails offline.
+                url: "http://not-allowed.invalid/openvino-x.whl".into(),
+                sha256: sha256.into(),
+                trust,
+                kind: Kind::Openvino,
+                build: None,
+            },
+            npu: Npu {
+                driver_installed: None,
+                driver_required: None,
+                compiler_present: false,
+            },
+            warnings: vec![],
+        }
+    }
+
+    fn options() -> Options {
+        Options {
+            allow_unverified: false,
+            allow_downgrade: false,
+            force: false,
+            build_dir: PathBuf::new(),
+            jobs: 1,
+        }
+    }
+
+    /// A prefix as ovfetch leaves it: one library, its sums, and a lock.
+    fn installed(openvino: &str, sha256: &str) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.0.join("libopenvino.so.2026.4.1"), b"ov").unwrap();
+        write_sums(&dir.0).unwrap();
+        fs::write(
+            dir.0.join(LOCK),
+            serde_json::json!({"openvino": openvino, "artifact": {"sha256": sha256}}).to_string(),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_newer_install_is_kept_unless_downgrade_is_allowed() {
+        let prefix = installed("2026.4.1", "old");
+        let p = plan("2026.3.0", "new", Trust::Verified);
+        let no_fetch = |_: &str| -> Vec<String> { panic!("fetched") };
+        let err = install(&p, &prefix.0, &options(), no_fetch).unwrap_err();
+        assert!(err.to_string().contains("--allow-downgrade"), "{err}");
+
+        // Allowed, it moves on to the next gate.
+        let p = plan("2026.3.0", "new", Trust::Unverified);
+        let opts = Options {
+            allow_downgrade: true,
+            ..options()
+        };
+        let err = install(&p, &prefix.0, &opts, no_fetch).unwrap_err();
+        assert!(err.to_string().contains("--allow-unverified"), "{err}");
+    }
+
+    #[test]
+    fn an_unverified_artifact_needs_the_flag() {
+        let prefix = TempDir::new().unwrap();
+        let p = plan("2026.4.1", "new", Trust::Unverified);
+        let no_fetch = |_: &str| -> Vec<String> { panic!("fetched") };
+        let err = install(&p, &prefix.0.join("ort"), &options(), no_fetch).unwrap_err();
+        assert!(err.to_string().contains("--allow-unverified"), "{err}");
+        assert!(!prefix.0.join("ort").exists());
+    }
+
+    #[test]
+    fn a_matching_intact_install_is_left_alone() {
+        let prefix = installed("2026.4.1", "same");
+        let p = plan("2026.4.1", "same", Trust::Verified);
+        install(&p, &prefix.0, &options(), |_| panic!("fetched")).unwrap();
+        verify(&prefix.0).unwrap();
+    }
+
+    /// Runs install expecting it to go past every gate to the download, which
+    /// the plan's URL makes fail offline.
+    fn reaches_the_download(p: &Plan, prefix: &Path, opts: &Options) {
+        let asked = std::cell::Cell::new(false);
+        let err = install(p, prefix, opts, |_| {
+            asked.set(true);
+            vec![]
+        })
+        .unwrap_err();
+        assert!(asked.get(), "stopped before the download: {err:#}");
+        assert!(err.to_string().contains("non-HTTPS"), "{err:#}");
+    }
+
+    #[test]
+    fn force_or_a_modified_install_downloads_again() {
+        let prefix = installed("2026.4.1", "same");
+        let p = plan("2026.4.1", "same", Trust::Verified);
+        let force = Options {
+            force: true,
+            ..options()
+        };
+        reaches_the_download(&p, &prefix.0, &force);
+
+        fs::write(prefix.0.join("libopenvino.so.2026.4.1"), b"changed").unwrap();
+        reaches_the_download(&p, &prefix.0, &options());
+        // The failed download left the prefix as it was.
+        assert_eq!(
+            fs::read(prefix.0.join("libopenvino.so.2026.4.1")).unwrap(),
+            b"changed"
+        );
+    }
+
+    #[test]
+    fn a_prefix_with_foreign_files_is_refused_and_left_intact() {
+        let prefix = installed("2026.4.1", "old");
+        fs::write(prefix.0.join("notes.txt"), b"mine").unwrap();
+        let p = plan("2026.4.1", "new", Trust::Verified);
+        let err = install(&p, &prefix.0, &options(), |_| panic!("fetched")).unwrap_err();
+        assert!(err.to_string().contains("notes.txt"), "{err}");
+        assert_eq!(fs::read(prefix.0.join("notes.txt")).unwrap(), b"mine");
+    }
+
+    #[test]
+    fn place_replaces_a_symlinked_prefix_where_it_points() {
+        let dir = TempDir::new().unwrap();
+        let real = dir.0.join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("libopenvino.so.2026.3.0"), b"old").unwrap();
+        write_sums(&real).unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o750)).unwrap();
+        symlink(&real, dir.0.join("link")).unwrap();
+
+        let lib = dir.0.join("staging");
+        fs::create_dir(&lib).unwrap();
+        fs::write(lib.join("libfoo.so.1"), elf_with_runpath(b"$ORIGIN")).unwrap();
+        let got = place(&lib, &dir.0.join("link"), &serde_json::json!({})).unwrap();
+
+        assert_eq!(got, fs::canonicalize(&real).unwrap());
+        assert!(dir.0.join("link").is_symlink());
+        assert_eq!(
+            fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+        let mut names: Vec<String> = fs::read_dir(&real)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["SHA256SUMS", "libfoo.so", "libfoo.so.1", LOCK]);
+        verify(&real).unwrap();
+        // Nothing staged or set aside is left beside it.
+        let mut left: Vec<String> = fs::read_dir(&dir.0)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["link", "real", "staging"]);
     }
 }
