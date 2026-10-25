@@ -151,7 +151,7 @@ pub fn pypi_claims(file: &PypiFile, pages: &MirrorPages) -> Vec<Claim> {
     let marker = format!("{}#sha256=", file.filename);
     for (base, page) in pages {
         let (digest, error) = match page {
-            Ok(page) => match page.find(&marker) {
+            Ok(page) => match find_listing(page, &file.filename) {
                 Some(i) => (
                     Some(page[i + marker.len()..].chars().take(64).collect()),
                     None,
@@ -169,6 +169,15 @@ pub fn pypi_claims(file: &PypiFile, pages: &MirrorPages) -> Vec<Claim> {
     claims
 }
 
+/// Where `filename#sha256=` starts in a simple-index page, as a whole file
+/// name: `x-1.0.whl` must not match inside a link to `prefix-x-1.0.whl`.
+fn find_listing(page: &str, filename: &str) -> Option<usize> {
+    let marker = format!("{filename}#sha256=");
+    page.match_indices(&marker)
+        .map(|(i, _)| i)
+        .find(|&i| matches!(page[..i].chars().next_back(), Some('/' | '"' | '\'')))
+}
+
 /// Download URLs for `file` on each mirror that listed it, for spreading
 /// downloads across sources. Relative hrefs are resolved against the page.
 pub fn pypi_download_urls(file: &PypiFile, pages: &MirrorPages) -> Vec<String> {
@@ -179,7 +188,7 @@ pub fn pypi_download_urls(file: &PypiFile, pages: &MirrorPages) -> Vec<String> {
     for (base, page) in pages {
         let page_url = format!("{base}/{}/", file.project);
         let Ok(page) = page else { continue };
-        let Some(end) = page.find(&format!("{}#sha256=", file.filename)) else {
+        let Some(end) = find_listing(page, &file.filename) else {
             continue;
         };
         let Some(start) = page[..end].rfind("href=\"") else {
@@ -328,6 +337,42 @@ mod tests {
             resolve_href("https://m.example/simple/pkg/", "/files/f.whl"),
             "https://m.example/files/f.whl"
         );
+    }
+
+    fn wheel(filename: &str) -> PypiFile {
+        PypiFile {
+            project: "p".into(),
+            version: "1.0".into(),
+            filename: filename.into(),
+            url: String::new(),
+            size: 0,
+            sha256: "a".repeat(64),
+            uploaded: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_mirror_listing_matches_the_whole_file_name() {
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        let page = format!(
+            "<a href=\"../../f/x-p-1.0.whl#sha256={b}\">x-p-1.0.whl</a>\n\
+             <a href=\"../../f/p-1.0.whl#sha256={a}\">p-1.0.whl</a>\n"
+        );
+        let pages: MirrorPages = vec![("https://m.example/simple", Ok(page))];
+        let file = wheel("p-1.0.whl");
+        let claims = pypi_claims(&file, &pages);
+        assert_eq!(claims[1].digest.as_deref(), Some(a.as_str()));
+        assert_eq!(
+            pypi_download_urls(&file, &pages),
+            ["https://m.example/f/p-1.0.whl"]
+        );
+
+        // Only the longer name is listed: the mirror does not have this file.
+        let page = format!("<a href=\"/f/x-p-1.0.whl#sha256={b}\">x</a>");
+        let pages: MirrorPages = vec![("https://m.example/simple", Ok(page))];
+        let claims = pypi_claims(&file, &pages);
+        assert_eq!(claims[1].digest, None);
+        assert!(pypi_download_urls(&file, &pages).is_empty());
     }
 
     #[test]
