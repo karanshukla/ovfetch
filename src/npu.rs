@@ -5,8 +5,14 @@ use crate::ci::NPU_DRIVER_REPO;
 use crate::consensus::Trust;
 use crate::data::Data;
 use crate::detect::{self, Machine, NPU_PRELOAD};
-use crate::install::{self, TempDir};
+use crate::install;
+use crate::libs::is_runtime_lib;
+use crate::listing::file_names;
+use crate::prefix::{
+    installed_npu_mode, installed_sha256, place, refuse_foreign, resolved, verify,
+};
 use crate::sources;
+use crate::tempdir::TempDir;
 use crate::version::Ver;
 use anyhow::{Context, Result, bail};
 use std::fs;
@@ -29,6 +35,22 @@ pub enum Mode {
     Compiler,
     /// The user-mode driver and its compiler, used instead of the host's.
     Full,
+}
+
+impl Mode {
+    /// The name the lock file records, the same one serde writes.
+    fn lock_name(self) -> &'static str {
+        match self {
+            Mode::Compiler => "compiler",
+            Mode::Full => "full",
+        }
+    }
+
+    /// Whether a prefix installed as `installed` already holds this mode: a
+    /// full install also covers a request for the compiler alone.
+    fn is_covered_by(self, installed: &str) -> bool {
+        installed == self.lock_name() || installed == Mode::Full.lock_name()
+    }
 }
 
 pub struct Options {
@@ -183,7 +205,7 @@ fn unpack_libs(data_tar_gz: &[u8], dest: &Path) -> Result<Vec<String>> {
         let Some(file) = path.trim_start_matches("./").strip_prefix(LIB_DIR) else {
             continue;
         };
-        if file.contains('/') || !install::is_runtime_lib(file) {
+        if file.contains('/') || !is_runtime_lib(file) {
             continue;
         }
         let out = dest.join(file);
@@ -275,16 +297,10 @@ pub fn install(plan: &Plan, host: &Machine, prefix: &Path, opts: &Options) -> Re
         );
         return Ok(());
     }
-    let lock_mode = fs::read_to_string(prefix.join("ovfetch.lock.json"))
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .and_then(|l| l["mode"].as_str().map(str::to_owned));
     if !opts.force
-        && install::installed_sha256(prefix).as_deref() == Some(plan.sha256.as_str())
-        // A full install also covers a request for the compiler alone.
-        && (lock_mode.as_deref() == serde_json::to_value(plan.mode)?.as_str()
-            || lock_mode.as_deref() == Some("full"))
-        && install::verify(prefix).is_ok()
+        && installed_sha256(prefix).as_deref() == Some(plan.sha256.as_str())
+        && installed_npu_mode(prefix).is_some_and(|installed| plan.mode.is_covered_by(&installed))
+        && verify(prefix).is_ok()
     {
         eprintln!(
             "already installed: {} matches {}; pass --force to reinstall",
@@ -293,7 +309,7 @@ pub fn install(plan: &Plan, host: &Machine, prefix: &Path, opts: &Options) -> Re
         );
         return Ok(());
     }
-    install::refuse_foreign(prefix)?;
+    refuse_foreign(prefix)?;
 
     if plan.mode == Mode::Full {
         require_ze_loader()?;
@@ -337,7 +353,7 @@ pub fn install(plan: &Plan, host: &Machine, prefix: &Path, opts: &Options) -> Re
         )
     })?;
 
-    let final_prefix = install::resolved(prefix)?;
+    let final_prefix = resolved(prefix)?;
     fs::write(
         lib.join(NPU_PRELOAD),
         preload_list(&final_prefix, &route, mode),
@@ -347,7 +363,7 @@ pub fn install(plan: &Plan, host: &Machine, prefix: &Path, opts: &Options) -> Re
         "mode": mode,
         "artifact": { "id": plan.id, "sha256": plan.sha256, "trust": plan.trust },
     });
-    let prefix = install::place(&lib, prefix, &lock)?;
+    let prefix = place(&lib, prefix, &lock)?;
     let what = match mode {
         Mode::Compiler => "compiler",
         Mode::Full => "user-mode driver and compiler",
@@ -381,10 +397,7 @@ fn require_ze_loader() -> Result<()> {
 /// driver is there too, a route through [`detect::COMPILER_BESIDE_DRIVER`]
 /// does not count: the driver would look for it in its own directory.
 fn covered(needs: &[Vec<String>], lib: &Path, with_driver: bool) -> Result<Option<Vec<String>>> {
-    let have: Vec<String> = fs::read_dir(lib)?
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
+    let have = file_names(lib)?;
     Ok(needs
         .iter()
         .filter(|set| with_driver || !set.iter().any(|l| l == detect::COMPILER_BESIDE_DRIVER))
@@ -560,6 +573,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_lock_names_a_mode_as_serde_does() {
+        for mode in [Mode::Compiler, Mode::Full] {
+            assert_eq!(serde_json::json!(mode), mode.lock_name());
+        }
+    }
+
+    #[test]
+    fn a_mode_is_covered_by_itself_or_by_a_full_install() {
+        assert!(Mode::Compiler.is_covered_by("compiler"));
+        assert!(Mode::Compiler.is_covered_by("full"));
+        assert!(Mode::Full.is_covered_by("full"));
+        assert!(!Mode::Full.is_covered_by("compiler"));
+        assert!(!Mode::Compiler.is_covered_by("something else"));
+    }
+
     fn opts(driver: Option<&str>, full: bool) -> Options {
         Options {
             driver: driver.map(Into::into),
@@ -647,9 +676,9 @@ mod tests {
     fn npu_prefix(mode: &str) -> TempDir {
         let dir = TempDir::new().unwrap();
         fs::write(dir.0.join("libnpu_driver_compiler.so"), b"c").unwrap();
-        install::write_sums(&dir.0).unwrap();
+        crate::prefix::write_sums(&dir.0).unwrap();
         fs::write(
-            dir.0.join("ovfetch.lock.json"),
+            dir.0.join(crate::prefix::LOCK),
             serde_json::json!({"mode": mode, "artifact": {"sha256": "same"}}).to_string(),
         )
         .unwrap();

@@ -3,9 +3,9 @@
 
 use crate::consensus;
 use crate::data::{Data, Entry, NpuDriver, Platform};
-use crate::install::TempDir;
 use crate::net;
 use crate::sources::{self, PypiFile};
+use crate::tempdir::TempDir;
 use crate::version::Ver;
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
