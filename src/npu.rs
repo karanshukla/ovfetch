@@ -90,9 +90,7 @@ fn choose(host: &Machine, data: &Data, opts: &Options) -> Result<(String, Mode)>
                 return Ok((want.clone(), Mode::Full));
             }
             let codenames: Vec<&str> = host
-                .devices
-                .iter()
-                .filter(|d| d.kind == "npu")
+                .npus()
                 .filter_map(|d| data.platforms.list.iter().find(|p| p.pci_id == d.pci_id))
                 .map(|p| p.codename.as_str())
                 .filter(|c| !c.is_empty())
@@ -274,7 +272,7 @@ fn preload_list(prefix: &Path, compiler: &[String], mode: Mode) -> String {
     }
     let mut libs: Vec<&str> = compiler.iter().rev().map(String::as_str).collect();
     if mode == Mode::Full {
-        libs.push("libze_intel_npu.so.1");
+        libs.push(detect::NPU_DRIVER);
     }
     lines.extend(libs.iter().map(|l| prefix.join(l).display().to_string()));
     lines.iter().map(|l| format!("{l}\n")).collect()
@@ -342,8 +340,8 @@ pub fn install(plan: &Plan, host: &Machine, prefix: &Path, opts: &Options) -> Re
     let needs = match mode {
         Mode::Compiler => host.npu_compiler_needs.clone(),
         Mode::Full => detect::compiler_needs(
-            &fs::read(lib.join("libze_intel_npu.so.1"))
-                .context("the driver package has no libze_intel_npu.so.1")?,
+            &fs::read(lib.join(detect::NPU_DRIVER))
+                .with_context(|| format!("the driver package has no {}", detect::NPU_DRIVER))?,
         ),
     };
     let route = covered(&needs, &lib, mode == Mode::Full)?.with_context(|| {

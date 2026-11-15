@@ -387,7 +387,7 @@ pub fn resolve(
 /// The oldest driver known to work with `ov`, raised to the platform's
 /// first verified driver.
 fn npu_requirements(machine: &Machine, data: &Data, ov: &Ver, warnings: &mut Vec<String>) -> Npu {
-    let npus: Vec<_> = machine.devices.iter().filter(|d| d.kind == "npu").collect();
+    let npus: Vec<_> = machine.npus().collect();
     let mut required: Option<Ver> = data
         .npu_drivers
         .list

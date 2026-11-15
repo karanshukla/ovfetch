@@ -21,7 +21,7 @@ pub fn floor(machine: &Machine, data: &Data, override_min: Option<&str>) -> Floo
         };
     }
     let mut best: Option<(Ver, String)> = None;
-    for npu in machine.devices.iter().filter(|d| d.kind == "npu") {
+    for npu in machine.npus() {
         let platform = data.platforms.list.iter().find(|p| p.pci_id == npu.pci_id);
         match platform.and_then(|p| Some((p, Ver::parse(p.min_openvino.as_deref()?)?))) {
             Some((p, v)) if best.as_ref().is_none_or(|(b, _)| v > *b) => {
@@ -52,7 +52,7 @@ pub fn floor(machine: &Machine, data: &Data, override_min: Option<&str>) -> Floo
 /// recorded release at or below it, at Intel's pairing or a newer measured
 /// version. Deliberately pessimistic: beyond it is untested, not known to fail.
 pub fn driver_ceiling(machine: &Machine, data: &Data) -> Option<Ver> {
-    if !machine.devices.iter().any(|d| d.kind == "npu") {
+    if !machine.has_npu() {
         return None;
     }
     let installed = Ver::parse(machine.npu_driver.as_deref()?)?;
@@ -80,7 +80,7 @@ pub struct Status<'a> {
 }
 
 pub fn status<'a>(machine: &'a Machine, data: &'a Data) -> Status<'a> {
-    let npus: Vec<_> = machine.devices.iter().filter(|d| d.kind == "npu").collect();
+    let npus: Vec<_> = machine.npus().collect();
     let platforms: Vec<&Platform> = data
         .platforms
         .list
