@@ -3,6 +3,7 @@
 use crate::net;
 use crate::version::Ver;
 use anyhow::{Context, Result};
+use url::Url;
 
 /// PyPI plus independently operated mirrors. A mirror that disagrees with the
 /// rest is the signal; one that is down or behind is not.
@@ -24,10 +25,36 @@ pub struct PypiFile {
     pub uploaded: String,
 }
 
+const PYPI_ID_PREFIX: &str = "pypi/";
+
 impl PypiFile {
     pub fn ledger_id(&self) -> String {
-        format!("pypi/{}/{}", self.project, self.filename)
+        format!("{PYPI_ID_PREFIX}{}/{}", self.project, self.filename)
     }
+}
+
+/// The `(project, filename)` a `pypi/<project>/<filename>` ledger id names.
+pub fn pypi_id_parts(ledger_id: &str) -> Option<(&str, &str)> {
+    ledger_id.strip_prefix(PYPI_ID_PREFIX)?.split_once('/')
+}
+
+/// Every place the PyPI file behind `ledger_id` can be downloaded from, from
+/// the mirrors that list it. Empty for an id that is not a PyPI file.
+pub fn mirror_download_urls(ledger_id: &str) -> Vec<String> {
+    let Some((project, filename)) = pypi_id_parts(ledger_id) else {
+        return Vec::new();
+    };
+    let file = PypiFile {
+        project: project.into(),
+        version: String::new(),
+        filename: filename.into(),
+        url: String::new(),
+        size: 0,
+        sha256: String::new(),
+        uploaded: String::new(),
+    };
+    let urls = pypi_download_urls(&file, &mirror_pages(project));
+    urls.into_iter().filter(|u| !u.is_empty()).collect()
 }
 
 /// Every non-yanked Linux x86_64 wheel for `project`, newest release first.
@@ -210,25 +237,24 @@ pub fn pypi_download_urls(file: &PypiFile, pages: &MirrorPages) -> Vec<String> {
     urls
 }
 
+/// The URL a mirror page's `href` points at. One that cannot be resolved,
+/// or climbs above the page's root, comes back as written for `check_url`
+/// to refuse.
 fn resolve_href(page: &str, href: &str) -> String {
     if href.starts_with("http") {
         return href.to_owned();
     }
-    if let Some(rest) = href.strip_prefix('/') {
-        let origin: String = page.splitn(4, '/').take(3).collect::<Vec<_>>().join("/");
-        return format!("{origin}/{rest}");
+    let Ok(page) = Url::parse(page) else {
+        return href.to_owned();
+    };
+    let page_depth = page
+        .path_segments()
+        .map_or(0, |segments| segments.filter(|s| !s.is_empty()).count());
+    let climbs = href.split('/').filter(|part| *part == "..").count();
+    match page.join(href) {
+        Ok(resolved) if climbs <= page_depth => resolved.into(),
+        _ => href.to_owned(),
     }
-    let mut base: Vec<&str> = page.trim_end_matches('/').split('/').collect();
-    for part in href.split('/') {
-        match part {
-            ".." => {
-                base.pop();
-            }
-            "." => {}
-            p => base.push(p),
-        }
-    }
-    base.join("/")
 }
 
 #[derive(Debug, Clone)]
@@ -332,6 +358,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_pypi_ledger_id_splits_back_into_project_and_file() {
+        let file = wheel("openvino-2026.4.1-cp313-abi3-manylinux_2_28_x86_64.whl");
+        assert_eq!(
+            pypi_id_parts(&file.ledger_id()),
+            Some((file.project.as_str(), file.filename.as_str()))
+        );
+        assert_eq!(
+            pypi_id_parts("github/intel/linux-npu-driver/v1.35.0/x.tar.gz"),
+            None
+        );
+        assert_eq!(pypi_id_parts("pypi/no-file"), None);
+        assert!(mirror_download_urls("github/intel/linux-npu-driver/v1.35.0/x.tar.gz").is_empty());
+    }
+
+    #[test]
     fn resolves_relative_mirror_hrefs() {
         assert_eq!(
             resolve_href(
@@ -344,6 +385,50 @@ mod tests {
             resolve_href("https://m.example/simple/pkg/", "/files/f.whl"),
             "https://m.example/files/f.whl"
         );
+    }
+
+    fn href(page: &str, href: &str) -> anyhow::Result<String> {
+        let url = resolve_href(page, href);
+        net::check_url(&url)?;
+        Ok(url)
+    }
+
+    #[test]
+    fn a_mirror_href_resolves_in_each_form_mirrors_use() {
+        let page = "https://mirrors.aliyun.com/pypi/simple/openvino/";
+        assert_eq!(
+            href(page, "../../packages/ab/cd/f.whl").unwrap(),
+            "https://mirrors.aliyun.com/pypi/packages/ab/cd/f.whl"
+        );
+        assert_eq!(
+            href(page, "/pypi/packages/ab/f.whl").unwrap(),
+            "https://mirrors.aliyun.com/pypi/packages/ab/f.whl"
+        );
+        assert_eq!(
+            href(page, "https://files.pythonhosted.org/packages/ab/f.whl").unwrap(),
+            "https://files.pythonhosted.org/packages/ab/f.whl"
+        );
+        assert_eq!(
+            href(page, "./f.whl").unwrap(),
+            "https://mirrors.aliyun.com/pypi/simple/openvino/f.whl"
+        );
+    }
+
+    #[test]
+    fn a_mirror_href_cannot_leave_the_allowed_hosts() {
+        let page = "https://mirrors.aliyun.com/pypi/simple/openvino/";
+        for bad in [
+            "https://evil.example/f.whl",
+            "http://mirrors.aliyun.com/f.whl",
+            "https://user@mirrors.aliyun.com/f.whl",
+            "https://mirrors.aliyun.com:8443/f.whl",
+            "httpx/f.whl",
+            "../../../../evil.example/f.whl",
+            "../../../../../evil.example/f.whl",
+            "../../../../../../evil.example/f.whl",
+        ] {
+            assert!(href(page, bad).is_err(), "{bad:?}");
+        }
     }
 
     fn wheel(filename: &str) -> PypiFile {

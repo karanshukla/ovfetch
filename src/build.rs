@@ -293,11 +293,11 @@ mod tests {
     #[test]
     fn refuses_a_build_dir_others_can_write() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = install::TempDir::new().unwrap();
-        ensure_private(&dir.0).unwrap();
-        fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(ensure_private(&dir.0).is_err());
-        fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = crate::tempdir::private().unwrap();
+        ensure_private(dir.path()).unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(ensure_private(dir.path()).is_err());
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
         assert!(ensure_private(Path::new("/")).is_err() || euid().unwrap() == 0);
     }
 

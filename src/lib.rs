@@ -16,12 +16,24 @@ pub mod ci;
 #[cfg(feature = "cli")]
 pub mod consensus;
 #[cfg(feature = "cli")]
+mod elf;
+#[cfg(feature = "cli")]
 pub mod install;
+#[cfg(feature = "cli")]
+mod libs;
+#[cfg(feature = "cli")]
+mod listing;
 #[cfg(feature = "cli")]
 pub mod net;
 #[cfg(feature = "cli")]
 pub mod npu;
 #[cfg(feature = "cli")]
+mod prefix;
+#[cfg(feature = "cli")]
 pub mod resolve;
 #[cfg(feature = "cli")]
 pub mod sources;
+#[cfg(feature = "cli")]
+mod tempdir;
+#[cfg(feature = "cli")]
+pub mod upstream;

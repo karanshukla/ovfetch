@@ -13,38 +13,83 @@ pub struct Floor {
     pub reason: String,
 }
 
-pub fn floor(machine: &Machine, data: &Data, override_min: Option<&str>) -> Floor {
-    if let Some(v) = override_min {
-        return Floor {
-            openvino: Some(v.to_owned()),
-            reason: "--min-openvino".into(),
-        };
+/// Where the floor comes from. [`Floor`] is the form `detect` and `resolve`
+/// print; code that has to act on the cause matches on this instead of on
+/// the wording.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FloorSource {
+    /// `--min-openvino`, kept as the user typed it.
+    Override(String),
+    /// The highest floor among the machine's NPUs.
+    Platform {
+        openvino: Ver,
+        codename: String,
+        pci_id: String,
+    },
+    NoNpu,
+    /// An NPU the data has no floor for, so no version is known to be safe.
+    UnknownNpu {
+        pci_id: String,
+    },
+}
+
+impl From<FloorSource> for Floor {
+    fn from(source: FloorSource) -> Floor {
+        match source {
+            FloorSource::Override(openvino) => Floor {
+                openvino: Some(openvino),
+                reason: "--min-openvino".into(),
+            },
+            FloorSource::Platform {
+                openvino,
+                codename,
+                pci_id,
+            } => Floor {
+                openvino: Some(openvino.to_string()),
+                reason: format!("{codename} NPU ({pci_id})"),
+            },
+            FloorSource::NoNpu => Floor {
+                openvino: None,
+                reason: "no Intel NPU; any current OpenVINO runs the CPU and GPU".into(),
+            },
+            FloorSource::UnknownNpu { pci_id } => Floor {
+                openvino: None,
+                reason: format!("NPU {pci_id} has no known floor yet"),
+            },
+        }
     }
-    let mut best: Option<(Ver, String)> = None;
-    for npu in machine.devices.iter().filter(|d| d.kind == "npu") {
+}
+
+pub fn floor(machine: &Machine, data: &Data, override_min: Option<&str>) -> Floor {
+    floor_source(machine, data, override_min).into()
+}
+
+pub fn floor_source(machine: &Machine, data: &Data, override_min: Option<&str>) -> FloorSource {
+    if let Some(openvino) = override_min {
+        return FloorSource::Override(openvino.to_owned());
+    }
+    let mut highest: Option<(Ver, &Platform)> = None;
+    for npu in machine.npus() {
         let platform = data.platforms.list.iter().find(|p| p.pci_id == npu.pci_id);
         match platform.and_then(|p| Some((p, Ver::parse(p.min_openvino.as_deref()?)?))) {
-            Some((p, v)) if best.as_ref().is_none_or(|(b, _)| v > *b) => {
-                best = Some((v, format!("{} NPU ({})", p.codename, p.pci_id)));
+            Some((p, v)) if highest.as_ref().is_none_or(|(h, _)| v > *h) => {
+                highest = Some((v, p));
             }
             Some(_) => {}
             None => {
-                return Floor {
-                    openvino: None,
-                    reason: format!("NPU {} has no known floor yet", npu.pci_id),
+                return FloorSource::UnknownNpu {
+                    pci_id: npu.pci_id.clone(),
                 };
             }
         }
     }
-    match best {
-        Some((v, reason)) => Floor {
-            openvino: Some(v.to_string()),
-            reason,
+    match highest {
+        Some((openvino, platform)) => FloorSource::Platform {
+            openvino,
+            codename: platform.codename.clone(),
+            pci_id: platform.pci_id.clone(),
         },
-        None => Floor {
-            openvino: None,
-            reason: "no Intel NPU; any current OpenVINO runs the CPU and GPU".into(),
-        },
+        None => FloorSource::NoNpu,
     }
 }
 
@@ -52,7 +97,7 @@ pub fn floor(machine: &Machine, data: &Data, override_min: Option<&str>) -> Floo
 /// recorded release at or below it, at Intel's pairing or a newer measured
 /// version. Deliberately pessimistic: beyond it is untested, not known to fail.
 pub fn driver_ceiling(machine: &Machine, data: &Data) -> Option<Ver> {
-    if !machine.devices.iter().any(|d| d.kind == "npu") {
+    if !machine.has_npu() {
         return None;
     }
     let installed = Ver::parse(machine.npu_driver.as_deref()?)?;
@@ -80,7 +125,7 @@ pub struct Status<'a> {
 }
 
 pub fn status<'a>(machine: &'a Machine, data: &'a Data) -> Status<'a> {
-    let npus: Vec<_> = machine.devices.iter().filter(|d| d.kind == "npu").collect();
+    let npus: Vec<_> = machine.npus().collect();
     let platforms: Vec<&Platform> = data
         .platforms
         .list
@@ -191,6 +236,76 @@ mod tests {
 
     fn ceiling(driver: &str, d: &Data) -> Option<String> {
         driver_ceiling(&npu_machine(driver), d).map(|v| v.to_string())
+    }
+
+    #[cfg(feature = "cli")]
+    fn platform(pci_id: &str, codename: &str, min_openvino: Option<&str>) -> Platform {
+        Platform {
+            pci_id: pci_id.into(),
+            kernel_name: "X".into(),
+            codename: codename.into(),
+            min_openvino: min_openvino.map(Into::into),
+            min_npu_driver: None,
+            pinned_note: None,
+        }
+    }
+
+    #[cfg(feature = "cli")]
+    fn floor_json(machine: &Machine, override_min: Option<&str>) -> String {
+        let mut d = data(vec![]);
+        d.platforms.list = vec![
+            platform("0xfd3e", "Wildcat Lake", Some("2026.0")),
+            platform("0x7d1d", "Meteor Lake", Some("2025.1.0")),
+            platform("0xaaaa", "", None),
+        ];
+        serde_json::to_string(&floor(machine, &d, override_min)).unwrap()
+    }
+
+    #[cfg(feature = "cli")]
+    fn machine_with_npus(pci_ids: &[&str]) -> Machine {
+        let mut machine = npu_machine("1.35.0");
+        machine.devices = pci_ids
+            .iter()
+            .map(|id| Device {
+                kind: "npu",
+                pci_id: id.to_string(),
+                slot: String::new(),
+            })
+            .collect();
+        machine
+    }
+
+    /// serde_json is a `cli` dependency, so this runs with the default features.
+    #[cfg(feature = "cli")]
+    #[test]
+    fn the_floor_serialises_as_it_always_has() {
+        let wildcat = machine_with_npus(&["0xfd3e"]);
+        assert_eq!(
+            floor_json(&wildcat, None),
+            r#"{"openvino":"2026.0","reason":"Wildcat Lake NPU (0xfd3e)"}"#
+        );
+        assert_eq!(
+            floor_json(&wildcat, Some("v2026.2")),
+            r#"{"openvino":"v2026.2","reason":"--min-openvino"}"#
+        );
+        assert_eq!(
+            floor_json(&machine_with_npus(&["0x7d1d", "0xfd3e"]), None),
+            r#"{"openvino":"2026.0","reason":"Wildcat Lake NPU (0xfd3e)"}"#
+        );
+        assert_eq!(
+            floor_json(&machine_with_npus(&["0x7d1d"]), None),
+            r#"{"openvino":"2025.1.0","reason":"Meteor Lake NPU (0x7d1d)"}"#
+        );
+        assert_eq!(
+            floor_json(&machine_with_npus(&[]), None),
+            r#"{"openvino":null,"reason":"no Intel NPU; any current OpenVINO runs the CPU and GPU"}"#
+        );
+        for unknown in ["0xaaaa", "0xbbbb"] {
+            assert_eq!(
+                floor_json(&machine_with_npus(&["0xfd3e", unknown]), None),
+                format!(r#"{{"openvino":null,"reason":"NPU {unknown} has no known floor yet"}}"#)
+            );
+        }
     }
 
     #[test]

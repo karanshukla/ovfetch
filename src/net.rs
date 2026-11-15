@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::Duration;
+use url::Url;
 
 /// Every host ovfetch will talk to. A URL from an API response (PyPI's JSON,
 /// a mirror's href) is only data: if it names any other host, or a redirect
@@ -22,18 +23,33 @@ const ALLOWED_HOSTS: &[&str] = &[
 /// Rejects anything but `https://<allowed host>/...`: no plain HTTP, no
 /// userinfo, no explicit port, no host outside the list.
 pub fn check_url(url: &str) -> Result<()> {
-    url.strip_prefix("https://")
-        .with_context(|| format!("refusing non-HTTPS URL {url}"))?;
-    let authority = authority(url);
-    if authority.contains(['@', ':']) || !ALLOWED_HOSTS.contains(&authority) {
-        bail!("refusing {url}: {authority} is not an allowed host");
-    }
-    Ok(())
+    allowed_host(url).map(|_| ())
 }
 
-fn authority(url: &str) -> &str {
-    let rest = url.strip_prefix("https://").unwrap_or(url);
-    rest.split(['/', '?', '#']).next().unwrap_or_default()
+/// The allowed host `url` names, or why it is refused.
+fn allowed_host(url: &str) -> Result<String> {
+    let parsed = Url::parse(url).with_context(|| format!("refusing {url}: not a URL"))?;
+    if parsed.scheme() != "https" {
+        bail!("refusing non-HTTPS URL {url}");
+    }
+    let host = parsed.host_str().unwrap_or_default();
+    let has_userinfo = !parsed.username().is_empty() || parsed.password().is_some();
+    if has_userinfo || parsed.port().is_some() || !ALLOWED_HOSTS.contains(&host) {
+        bail!("refusing {url}: {host} is not an allowed host");
+    }
+    if !is_written_as_parsed(url, &parsed) {
+        bail!("refusing {url}: it does not spell {host} the way it parses");
+    }
+    Ok(host.to_owned())
+}
+
+/// The request is sent from the string, not from `parsed`, so the two must
+/// name the same origin: `HTTPS://`, `:443`, a backslash or a tab all parse
+/// to an allowed host and are refused here.
+fn is_written_as_parsed(url: &str, parsed: &Url) -> bool {
+    let origin = &parsed[..url::Position::BeforePath];
+    url.strip_prefix(origin)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(['/', '?', '#']))
 }
 
 const MAX_REDIRECTS: usize = 5;
@@ -69,11 +85,10 @@ fn agent() -> ureq::Agent {
 /// `Authorization` is only sent to the host it was meant for.
 fn get(url: &str, headers: &[(&str, &str)]) -> Result<ureq::http::Response<ureq::Body>> {
     let agent = agent();
-    let host = authority(url).to_owned();
+    let first_host = allowed_host(url)?;
     let mut url = url.to_owned();
     for _ in 0..=MAX_REDIRECTS {
-        check_url(&url)?;
-        let same_host = authority(&url) == host;
+        let same_host = allowed_host(&url)? == first_host;
         let mut req = agent.get(&url);
         for (k, v) in headers {
             if same_host || !k.eq_ignore_ascii_case("authorization") {
@@ -88,7 +103,7 @@ fn get(url: &str, headers: &[(&str, &str)]) -> Result<ureq::http::Response<ureq:
                 .get("location")
                 .and_then(|l| l.to_str().ok())
                 .with_context(|| format!("{url} redirected without a Location"))?;
-            url = resolve_location(&url, location);
+            url = resolve_location(&url, location)?;
             continue;
         }
         if !status.is_success() {
@@ -99,16 +114,20 @@ fn get(url: &str, headers: &[(&str, &str)]) -> Result<ureq::http::Response<ureq:
     bail!("more than {MAX_REDIRECTS} redirects from {url}")
 }
 
-/// Absolute, scheme-relative (`//host/x`), or path-absolute (`/x`) Location.
-fn resolve_location(from: &str, location: &str) -> String {
+/// Where a `Location` header points. An absolute or scheme-relative one is
+/// kept as written, so `check_url` judges exactly what the server sent; a
+/// path is resolved against `from`.
+fn resolve_location(from: &str, location: &str) -> Result<String> {
     if location.contains("://") {
-        return location.to_owned();
+        return Ok(location.to_owned());
     }
-    if let Some(rest) = location.strip_prefix("//") {
-        return format!("https://{rest}");
+    if let Some(host_and_path) = location.strip_prefix("//") {
+        return Ok(format!("https://{host_and_path}"));
     }
-    let origin: String = from.splitn(4, '/').take(3).collect::<Vec<_>>().join("/");
-    format!("{origin}/{}", location.trim_start_matches('/'))
+    let resolved = Url::parse(from)
+        .and_then(|from| from.join(location))
+        .with_context(|| format!("{from} redirected to {location:?}, which is not a URL"))?;
+    Ok(resolved.into())
 }
 
 pub fn get_json_accept(url: &str, accept: &str) -> Result<serde_json::Value> {
@@ -249,13 +268,121 @@ mod tests {
     fn redirect_locations_resolve_before_the_allowlist_check() {
         use super::resolve_location;
         let from = "https://pypi.org/simple/p/";
-        assert_eq!(resolve_location(from, "/x"), "https://pypi.org/x");
+        let resolve = |location: &str| resolve_location(from, location).unwrap();
+        assert_eq!(resolve("/x"), "https://pypi.org/x");
+        assert_eq!(resolve("//evil.example/x"), "https://evil.example/x");
+        assert!(check_url(&resolve("//evil.example/x")).is_err());
+        assert!(check_url(&resolve("http://pypi.org/x")).is_err());
+    }
+
+    #[test]
+    fn a_url_to_an_allowed_host_passes_in_each_form() {
+        for url in [
+            "https://pypi.org/simple/openvino/",
+            "https://pypi.org",
+            "https://pypi.org?format=json",
+            "https://pypi.org#files",
+            "https://api.github.com/repos/intel/linux-npu-driver/releases?per_page=100",
+            "https://release-assets.githubusercontent.com/x?sig=a%2Bb&se=2026-01-01T00%3A00%3A00Z",
+        ] {
+            check_url(url).unwrap_or_else(|e| panic!("{url}: {e}"));
+        }
+    }
+
+    #[test]
+    fn anything_but_https_is_refused() {
+        for url in [
+            "http://pypi.org/x",
+            "ftp://pypi.org/x",
+            "file:///etc/passwd",
+            "HTTPS://pypi.org/x",
+            "https:/pypi.org/x",
+            "https:pypi.org/x",
+            "//pypi.org/x",
+            "pypi.org/x",
+            " https://pypi.org/x",
+            "",
+        ] {
+            assert!(check_url(url).is_err(), "{url:?}");
+        }
+    }
+
+    #[test]
+    fn userinfo_and_ports_are_refused() {
+        for url in [
+            "https://user@pypi.org/x",
+            "https://user:secret@pypi.org/x",
+            "https://pypi.org@evil.example/x",
+            "https://pypi.org:443/x",
+            "https://pypi.org:8443/x",
+            "https://pypi.org:/x",
+        ] {
+            assert!(check_url(url).is_err(), "{url:?}");
+        }
+    }
+
+    #[test]
+    fn a_host_that_only_resembles_an_allowed_one_is_refused() {
+        for url in [
+            "https://evil.example/x",
+            "https://pypi.org.evil.example/x",
+            "https://evil-pypi.org/x",
+            "https://sub.pypi.org/x",
+            "https://PYPI.ORG/x",
+            "https://pypi.org./x",
+            "https://pypi%2Eorg/x",
+            "https://pypi.org\\@evil.example/x",
+            "https://evil.example\\.pypi.org/x",
+            "https://pypi.org\t/x",
+            "https://py\npi.org/x",
+            "https://pypi.org /x",
+            "https://[::1]/x",
+            "https://127.0.0.1/x",
+            "https:///pypi.org/x",
+        ] {
+            assert!(check_url(url).is_err(), "{url:?}");
+        }
+    }
+
+    fn redirect(from: &str, location: &str) -> anyhow::Result<String> {
+        let to = super::resolve_location(from, location)?;
+        check_url(&to)?;
+        Ok(to)
+    }
+
+    #[test]
+    fn a_redirect_stays_on_the_host_or_names_an_allowed_one() {
+        let from = "https://github.com/intel/linux-npu-driver/releases/download/v1/x.tar.gz";
+        assert_eq!(redirect(from, "/y").unwrap(), "https://github.com/y");
         assert_eq!(
-            resolve_location(from, "//evil.example/x"),
-            "https://evil.example/x"
+            redirect(from, "https://release-assets.githubusercontent.com/x?sig=1").unwrap(),
+            "https://release-assets.githubusercontent.com/x?sig=1"
         );
-        assert!(check_url(&resolve_location(from, "//evil.example/x")).is_err());
-        assert!(check_url(&resolve_location(from, "http://pypi.org/x")).is_err());
+        assert_eq!(
+            redirect(from, "//release-assets.githubusercontent.com/x").unwrap(),
+            "https://release-assets.githubusercontent.com/x"
+        );
+    }
+
+    #[test]
+    fn a_redirect_anywhere_else_is_refused() {
+        let from = "https://pypi.org/simple/p/";
+        for location in [
+            "https://evil.example/x",
+            "//evil.example/x",
+            "http://pypi.org/x",
+            "HTTPS://pypi.org/x",
+            "//PYPI.ORG/x",
+            "ftp://pypi.org/x",
+            "https://user@pypi.org/x",
+            "//user@pypi.org/x",
+            "https://pypi.org:8443/x",
+            "//pypi.org:8443/x",
+            "https://pypi.org.evil.example/x",
+            "/login?next=https://pypi.org/x",
+        ] {
+            assert!(redirect(from, location).is_err(), "{location:?}");
+        }
     }
 
     #[test]

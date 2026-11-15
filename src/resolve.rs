@@ -10,7 +10,8 @@ use crate::data::{Build, Data};
 use crate::detect::Machine;
 use crate::net;
 use crate::sources::{self, PypiFile};
-use crate::status::{Floor, compiler_warning, driver_ceiling, floor};
+use crate::status::{Floor, FloorSource, compiler_warning, driver_ceiling, floor_source};
+use crate::upstream::{Network, Upstream};
 use crate::version::Ver;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -78,13 +79,13 @@ pub struct Plan {
     pub warnings: Vec<String>,
 }
 
-fn agreed(file: &PypiFile, data: &Data) -> Result<(String, Trust)> {
-    let claims = sources::pypi_claims(file, &sources::mirror_pages(&file.project));
+fn agreed(upstream: &dyn Upstream, file: &PypiFile, data: &Data) -> Result<(String, Trust)> {
+    let claims = sources::pypi_claims(file, &upstream.mirror_pages(&file.project));
     consensus::agree(&file.ledger_id(), &claims, &data.ledger)
 }
 
-fn artifact(file: &PypiFile, data: &Data) -> Result<Artifact> {
-    let (sha256, trust) = agreed(file, data)?;
+fn artifact(upstream: &dyn Upstream, file: &PypiFile, data: &Data) -> Result<Artifact> {
+    let (sha256, trust) = agreed(upstream, file, data)?;
     Ok(Artifact {
         id: file.ledger_id(),
         onnxruntime: Some(file.version.clone()),
@@ -125,18 +126,16 @@ pub fn recipe_digest(build: &Build, openvino_sha256: &str) -> String {
     net::sha256_hex(text.as_bytes())
 }
 
-fn build_artifact(build: &Build, data: &Data) -> Result<Artifact> {
-    let (project, filename) = build
-        .openvino_wheel
-        .strip_prefix("pypi/")
-        .and_then(|r| r.split_once('/'))
+fn build_artifact(upstream: &dyn Upstream, build: &Build, data: &Data) -> Result<Artifact> {
+    let (project, filename) = sources::pypi_id_parts(&build.openvino_wheel)
         .with_context(|| format!("recipe input {} is not a PyPI file", build.openvino_wheel))?;
-    let wheel = sources::pypi_wheels(project)?
+    let wheel = upstream
+        .pypi_wheels(project)?
         .into_iter()
         .find(|w| w.filename == filename)
         .with_context(|| format!("{} is no longer on PyPI", build.openvino_wheel))?;
-    let (sha256, trust) = agreed(&wheel, data)?;
-    match sources::github_tag_commit(&build.git_repo, &build.git_tag) {
+    let (sha256, trust) = agreed(upstream, &wheel, data)?;
+    match upstream.github_tag_commit(&build.git_repo, &build.git_tag) {
         Ok(c) if c == build.git_commit => {}
         Ok(c) => bail!(
             "{} tag {} now points at {c}, but the recipe pins {}. A release tag moved; nothing was built.",
@@ -218,39 +217,55 @@ pub enum Want {
     OpenvinoOnly,
 }
 
-pub fn resolve(
+/// The OpenVINO range a machine can run, and why.
+struct Bounds {
+    floor: Floor,
+    /// The floor as a version; zero when nothing constrains it.
+    need: Ver,
+    ceiling: Option<Ver>,
+}
+
+impl Bounds {
+    /// ` and <= 2026.4 (NPU driver)`, or nothing without a ceiling.
+    fn ceiling_clause(&self) -> String {
+        self.ceiling
+            .as_ref()
+            .map(|c| format!(" and <= {c} (NPU driver)"))
+            .unwrap_or_default()
+    }
+
+    fn allows(&self, openvino: &Ver) -> bool {
+        self.ceiling.as_ref().is_none_or(|c| openvino.minor() <= *c)
+    }
+}
+
+const NO_FLOOR: u64 = 0;
+
+fn bounds(
     machine: &Machine,
     data: &Data,
     override_min: Option<&str>,
     ignore_driver: bool,
-    want: Want,
-) -> Result<Plan> {
-    let allow_build = match want {
-        Want::OnnxRuntime { allow_build } => allow_build,
-        Want::OpenvinoOnly => false,
-    };
-    let floor = floor(machine, data, override_min);
-    let mut warnings = Vec::new();
+) -> Result<Bounds> {
+    let source = floor_source(machine, data, override_min);
+    let floor = Floor::from(source.clone());
     let ceiling = if ignore_driver {
         None
     } else {
         driver_ceiling(machine, data)
     };
-    let Some(need) = floor
-        .openvino
-        .as_deref()
-        .map(Ver::parse)
-        .unwrap_or(Some(Ver(vec![0])))
-    else {
-        bail!("bad floor {:?}", floor.openvino);
-    };
-    if floor.reason.contains("no known floor") {
-        bail!(
+    let need = match &source {
+        FloorSource::Override(openvino) => {
+            Ver::parse(openvino).with_context(|| format!("bad floor {:?}", floor.openvino))?
+        }
+        FloorSource::Platform { openvino, .. } => openvino.clone(),
+        FloorSource::NoNpu => Ver(vec![NO_FLOOR]),
+        FloorSource::UnknownNpu { .. } => bail!(
             "{}. This platform is newer than ovfetch's data, so it cannot pick a safe OpenVINO. \
              Pass --min-openvino, or wait for `ci discover` to record it.",
             floor.reason
-        );
-    }
+        ),
+    };
     if let Some(c) = &ceiling
         && *c < need
     {
@@ -260,80 +275,176 @@ pub fn resolve(
             machine.npu_driver.as_deref().unwrap_or("?")
         );
     }
+    Ok(Bounds {
+        floor,
+        need,
+        ceiling,
+    })
+}
 
-    if want == Want::OpenvinoOnly {
-        let wheels = sources::pypi_wheels("openvino")?;
-        let Some((wheel, ov)) = pick_openvino(&wheels, data, &need, ceiling.as_ref()) else {
-            bail!(
-                "no openvino wheel fits this device: it needs OpenVINO >= {need}{}",
-                ceiling
-                    .as_ref()
-                    .map(|c| format!(" and <= {c} (NPU driver)"))
-                    .unwrap_or_default()
-            );
-        };
-        let mut artifact = artifact(&wheel, data)?;
-        artifact.onnxruntime = None;
-        artifact.kind = Kind::Openvino;
-        let npu = npu_requirements(machine, data, &ov, &mut warnings);
-        return Ok(Plan {
-            floor,
-            driver_ceiling: ceiling.map(|c| c.to_string()),
-            openvino: ov.to_string(),
-            artifact,
-            npu,
-            warnings,
-        });
-    }
+pub fn resolve(
+    machine: &Machine,
+    data: &Data,
+    override_min: Option<&str>,
+    ignore_driver: bool,
+    want: Want,
+) -> Result<Plan> {
+    resolve_with(&Network, machine, data, override_min, ignore_driver, want)
+}
 
-    // Wheels bundle ever-newer OpenVINO, so walk newest first and stop once
-    // one falls below the floor.
-    let wheels = sources::pypi_wheels("onnxruntime-openvino")?;
+/// [`resolve`] against any [`Upstream`].
+pub fn resolve_with(
+    upstream: &dyn Upstream,
+    machine: &Machine,
+    data: &Data,
+    override_min: Option<&str>,
+    ignore_driver: bool,
+    want: Want,
+) -> Result<Plan> {
+    let bounds = bounds(machine, data, override_min, ignore_driver)?;
+    let mut warnings = Vec::new();
+    let (artifact, openvino) = match want {
+        Want::OpenvinoOnly => openvino_alone(upstream, data, &bounds)?,
+        Want::OnnxRuntime { allow_build } => {
+            onnxruntime(upstream, machine, data, &bounds, allow_build, &mut warnings)?
+        }
+    };
+    let npu = npu_requirements(machine, data, &openvino, &mut warnings);
+    Ok(Plan {
+        floor: bounds.floor,
+        driver_ceiling: bounds.ceiling.map(|c| c.to_string()),
+        openvino: openvino.to_string(),
+        artifact,
+        npu,
+        warnings,
+    })
+}
+
+fn openvino_alone(
+    upstream: &dyn Upstream,
+    data: &Data,
+    bounds: &Bounds,
+) -> Result<(Artifact, Ver)> {
+    let wheels = upstream.pypi_wheels("openvino")?;
+    let Some((wheel, openvino)) =
+        pick_openvino(&wheels, data, &bounds.need, bounds.ceiling.as_ref())
+    else {
+        bail!(
+            "no openvino wheel fits this device: it needs OpenVINO >= {}{}",
+            bounds.need,
+            bounds.ceiling_clause()
+        );
+    };
+    let mut artifact = artifact(upstream, &wheel, data)?;
+    artifact.onnxruntime = None;
+    artifact.kind = Kind::Openvino;
+    Ok((artifact, openvino))
+}
+
+/// What the onnxruntime-openvino wheels on PyPI offer inside the bounds.
+struct Prebuilt {
+    /// The newest wheel whose OpenVINO fits, and that OpenVINO.
+    fitting: Option<(PypiFile, Ver)>,
+    /// The OpenVINO the newest wheel bundles, whether or not it fits.
+    newest_bundled: Option<Ver>,
+}
+
+/// Wheels bundle ever-newer OpenVINO, so this walks newest first and stops
+/// once one falls below the floor.
+fn prebuilt(upstream: &dyn Upstream, bounds: &Bounds) -> Result<Prebuilt> {
+    let wheels = upstream.pypi_wheels("onnxruntime-openvino")?;
     let mut versions: Vec<&str> = wheels.iter().map(|w| w.version.as_str()).collect();
     versions.dedup();
-    let mut newest_bundled = None;
-    let mut chosen = None;
-    for v in versions {
-        let Some(w) = sources::pick_wheel(&wheels, v) else {
+    let mut found = Prebuilt {
+        fitting: None,
+        newest_bundled: None,
+    };
+    for version in versions {
+        let Some(wheel) = sources::pick_wheel(&wheels, version) else {
             continue;
         };
-        let Some(ov) = sources::bundled_openvino(&w)? else {
+        let Some(openvino) = upstream.bundled_openvino(&wheel)? else {
             continue;
         };
-        newest_bundled.get_or_insert(ov.clone());
-        if ov.minor() < need {
+        found.newest_bundled.get_or_insert(openvino.clone());
+        if openvino.minor() < bounds.need {
             break;
         }
-        if ceiling.as_ref().is_none_or(|c| ov.minor() <= *c) {
-            chosen = Some((w, ov));
+        if bounds.allows(&openvino) {
+            found.fitting = Some((wheel, openvino));
             break;
         }
     }
-    let recipe = pick_build(&data.builds.list, &need, ceiling.as_ref()).filter(|b| {
-        let ov = Ver::parse(&b.openvino);
-        chosen
-            .as_ref()
-            .is_none_or(|(_, have)| ov.as_ref() > Some(have))
-    });
-    let recipe_hint = |b: &Build| {
-        format!(
-            "OpenVINO {} is available by compiling ONNX Runtime {} here; pass --build",
-            b.openvino, b.onnxruntime
-        )
-    };
+    Ok(found)
+}
 
-    if chosen.is_none() && !(allow_build && recipe.is_some()) {
+fn recipe_hint(recipe: &Build) -> String {
+    format!(
+        "OpenVINO {} is available by compiling ONNX Runtime {} here; pass --build",
+        recipe.openvino, recipe.onnxruntime
+    )
+}
+
+/// When the ceiling holds the pick below what the newest wheel bundles: the
+/// driver release that would lift it.
+fn held_back_warning(
+    machine: &Machine,
+    data: &Data,
+    bounds: &Bounds,
+    newest_bundled: Option<&Ver>,
+) -> Option<String> {
+    let ceiling = bounds.ceiling.as_ref()?;
+    if !newest_bundled.is_some_and(|n| n.minor() > *ceiling) {
+        return None;
+    }
+    let newer_driver = data
+        .npu_drivers
+        .list
+        .iter()
+        .filter(|d| d.max_openvino().is_some_and(|o| o.minor() > *ceiling))
+        .max_by_key(|d| Ver::parse(&d.version))?;
+    Some(format!(
+        "held at OpenVINO {ceiling}, the newest known to work with NPU driver {}; driver {} is known to work with OpenVINO {}",
+        machine.npu_driver.as_deref().unwrap_or("?"),
+        newer_driver.version,
+        newer_driver
+            .max_openvino()
+            .map(|v| v.to_string())
+            .unwrap_or_default()
+    ))
+}
+
+/// A prebuilt wheel when one fits; a recipe only when it offers a newer
+/// OpenVINO than that wheel, and is only built with `allow_build`.
+fn onnxruntime(
+    upstream: &dyn Upstream,
+    machine: &Machine,
+    data: &Data,
+    bounds: &Bounds,
+    allow_build: bool,
+    warnings: &mut Vec<String>,
+) -> Result<(Artifact, Ver)> {
+    let Prebuilt {
+        fitting,
+        newest_bundled,
+    } = prebuilt(upstream, bounds)?;
+    let recipe = pick_build(&data.builds.list, &bounds.need, bounds.ceiling.as_ref()).filter(|b| {
+        let openvino = Ver::parse(&b.openvino);
+        fitting
+            .as_ref()
+            .is_none_or(|(_, have)| openvino.as_ref() > Some(have))
+    });
+
+    if fitting.is_none() && !(allow_build && recipe.is_some()) {
         let newest = newest_bundled
             .as_ref()
             .map(|v| v.to_string())
             .unwrap_or_else(|| "none".into());
         bail!(
-            "no prebuilt ONNX Runtime + OpenVINO fits this device: it needs OpenVINO >= {need}{}, \
+            "no prebuilt ONNX Runtime + OpenVINO fits this device: it needs OpenVINO >= {}{}, \
              and the newest prebuilt build bundles {newest}. {}",
-            ceiling
-                .as_ref()
-                .map(|c| format!(" and <= {c} (NPU driver)"))
-                .unwrap_or_default(),
+            bounds.need,
+            bounds.ceiling_clause(),
             match recipe {
                 Some(b) => format!("{}.", recipe_hint(b)),
                 None => "No build recipe fits either; this resolves once Intel publishes a newer \
@@ -343,51 +454,30 @@ pub fn resolve(
         );
     }
 
-    if let Some(c) = &ceiling
-        && newest_bundled.as_ref().is_some_and(|n| n.minor() > *c)
-        && let Some(d) = data
-            .npu_drivers
-            .list
-            .iter()
-            .filter(|d| d.max_openvino().is_some_and(|o| o.minor() > *c))
-            .max_by_key(|d| Ver::parse(&d.version))
-    {
-        warnings.push(format!(
-            "held at OpenVINO {c}, the newest known to work with NPU driver {}; driver {} is known to work with OpenVINO {}",
-            machine.npu_driver.as_deref().unwrap_or("?"),
-            d.version,
-            d.max_openvino().map(|v| v.to_string()).unwrap_or_default()
-        ));
-    }
+    warnings.extend(held_back_warning(
+        machine,
+        data,
+        bounds,
+        newest_bundled.as_ref(),
+    ));
 
-    let (artifact, openvino) = match (recipe, chosen) {
-        (Some(b), _) if allow_build => (
-            build_artifact(b, data)?,
+    match (recipe, fitting) {
+        (Some(b), _) if allow_build => Ok((
+            build_artifact(upstream, b, data)?,
             Ver::parse(&b.openvino).context("bad recipe openvino")?,
-        ),
-        (r, Some((wheel, ov))) => {
-            if let Some(b) = r {
-                warnings.push(recipe_hint(b));
-            }
-            (artifact(&wheel, data)?, ov)
+        )),
+        (unused_recipe, Some((wheel, openvino))) => {
+            warnings.extend(unused_recipe.map(recipe_hint));
+            Ok((artifact(upstream, &wheel, data)?, openvino))
         }
         (_, None) => unreachable!("bailed above"),
-    };
-    let npu = npu_requirements(machine, data, &openvino, &mut warnings);
-    Ok(Plan {
-        floor,
-        driver_ceiling: ceiling.map(|c| c.to_string()),
-        openvino: openvino.to_string(),
-        artifact,
-        npu,
-        warnings,
-    })
+    }
 }
 
 /// The oldest driver known to work with `ov`, raised to the platform's
 /// first verified driver.
 fn npu_requirements(machine: &Machine, data: &Data, ov: &Ver, warnings: &mut Vec<String>) -> Npu {
-    let npus: Vec<_> = machine.devices.iter().filter(|d| d.kind == "npu").collect();
+    let npus: Vec<_> = machine.npus().collect();
     let mut required: Option<Ver> = data
         .npu_drivers
         .list
@@ -554,5 +644,354 @@ mod tests {
         let mut other = base;
         other.build_args.push("--x".into());
         assert_ne!(d, recipe_digest(&other, "aa"));
+    }
+
+    use crate::data::{Entry, Ledger, NpuDriver, NpuDrivers, Platform, Platforms};
+    use crate::detect::Device;
+    use crate::upstream::fake::{Fake, wheel};
+
+    const ORT: &str = "onnxruntime-openvino";
+
+    /// A Wildcat Lake NPU on `driver`, with its compiler in place.
+    fn npu_machine(driver: &str) -> Machine {
+        Machine {
+            devices: vec![Device {
+                kind: "npu",
+                pci_id: "0xfd3e".into(),
+                slot: String::new(),
+            }],
+            npu_driver: Some(driver.into()),
+            npu_compiler: true,
+            npu_compiler_needs: vec![],
+            npu_prefix: None,
+        }
+    }
+
+    fn no_npu() -> Machine {
+        Machine {
+            devices: vec![],
+            npu_driver: None,
+            npu_compiler: false,
+            npu_compiler_needs: vec![],
+            npu_prefix: None,
+        }
+    }
+
+    /// Wildcat Lake floors at 2025.2; driver 1.32.0 pairs with 2025.4 and
+    /// 1.35.0 with 2026.4. `recorded` wheels are in the ledger.
+    fn data(recorded: &[&PypiFile], builds: Vec<Build>) -> Data {
+        let driver = |version: &str, openvino: &str| NpuDriver {
+            version: version.into(),
+            openvino: openvino.into(),
+            platforms: vec!["Wildcat Lake".into()],
+            measured_openvino: None,
+            measured_note: None,
+        };
+        Data {
+            dir: None,
+            platforms: Platforms {
+                list: vec![Platform {
+                    pci_id: "0xfd3e".into(),
+                    kernel_name: "WCL".into(),
+                    codename: "Wildcat Lake".into(),
+                    min_openvino: Some("2025.2".into()),
+                    min_npu_driver: Some("1.32.0".into()),
+                    pinned_note: None,
+                }],
+            },
+            npu_drivers: NpuDrivers {
+                list: vec![driver("1.32.0", "2025.4"), driver("1.35.0", "2026.4")],
+            },
+            ledger: Ledger {
+                list: recorded
+                    .iter()
+                    .map(|w| Entry {
+                        id: w.ledger_id(),
+                        digest: w.sha256.clone(),
+                        first_seen: "2026-01-08".into(),
+                        provenance: false,
+                    })
+                    .collect(),
+            },
+            builds: crate::data::Builds { list: builds },
+        }
+    }
+
+    /// Three onnxruntime-openvino releases, newest first as PyPI lists them.
+    fn three_releases() -> (Fake, [PypiFile; 3]) {
+        let wheels = [
+            wheel(ORT, "1.25.0", "cp313", "c3"),
+            wheel(ORT, "1.24.1", "cp313", "c2"),
+            wheel(ORT, "1.22.0", "cp313", "c1"),
+        ];
+        let fake = Fake::default()
+            .bundling(wheels[0].clone(), "2026.5.0")
+            .bundling(wheels[1].clone(), "2025.4.1")
+            .bundling(wheels[2].clone(), "2025.1.0");
+        (fake, wheels)
+    }
+
+    const PREBUILT: Want = Want::OnnxRuntime { allow_build: false };
+
+    #[test]
+    fn the_newest_prebuilt_under_the_ceiling_is_chosen_and_the_hold_explained() {
+        let (fake, wheels) = three_releases();
+        let d = data(&[&wheels[1]], vec![]);
+        let plan = resolve_with(&fake, &npu_machine("1.32.0"), &d, None, false, PREBUILT).unwrap();
+        assert_eq!(plan.openvino, "2025.4.1");
+        assert_eq!(plan.driver_ceiling.as_deref(), Some("2025.4"));
+        assert_eq!(plan.floor.openvino.as_deref(), Some("2025.2"));
+        assert_eq!(plan.artifact.id, wheels[1].ledger_id());
+        assert_eq!(plan.artifact.kind, Kind::Wheel);
+        assert_eq!(plan.artifact.trust, Trust::Verified);
+        assert_eq!(plan.artifact.sha256, "c2".repeat(32));
+        assert_eq!(plan.artifact.onnxruntime.as_deref(), Some("1.24.1"));
+        assert_eq!(plan.npu.driver_required.as_deref(), Some("1.32.0"));
+        assert_eq!(
+            plan.warnings,
+            [
+                "held at OpenVINO 2025.4, the newest known to work with NPU driver 1.32.0; \
+              driver 1.35.0 is known to work with OpenVINO 2026.4"
+            ]
+        );
+    }
+
+    #[test]
+    fn ignoring_the_driver_lifts_the_ceiling() {
+        let (fake, wheels) = three_releases();
+        let d = data(&[], vec![]);
+        let plan = resolve_with(&fake, &npu_machine("1.32.0"), &d, None, true, PREBUILT).unwrap();
+        assert_eq!(plan.openvino, "2026.5.0");
+        assert_eq!(plan.driver_ceiling, None);
+        assert_eq!(plan.artifact.id, wheels[0].ledger_id());
+        assert_eq!(plan.artifact.trust, Trust::Unverified);
+    }
+
+    #[test]
+    fn without_an_npu_the_newest_build_is_chosen_with_no_bounds() {
+        let (fake, _) = three_releases();
+        let plan =
+            resolve_with(&fake, &no_npu(), &data(&[], vec![]), None, false, PREBUILT).unwrap();
+        assert_eq!(plan.openvino, "2026.5.0");
+        assert_eq!(plan.floor.openvino, None);
+        assert_eq!(plan.npu.driver_required, None);
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    }
+
+    #[test]
+    fn a_floor_above_every_prebuilt_stops_and_names_the_newest() {
+        let (fake, _) = three_releases();
+        let d = data(&[], vec![]);
+        let err = resolve_with(
+            &fake,
+            &npu_machine("1.35.0"),
+            &d,
+            Some("2026.6"),
+            true,
+            PREBUILT,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("needs OpenVINO >= 2026.6"), "{err}");
+        assert!(err.contains("bundles 2026.5.0"), "{err}");
+        assert!(err.contains("No build recipe fits either"), "{err}");
+    }
+
+    #[test]
+    fn a_floor_above_the_ceiling_stops_before_asking_upstream() {
+        let fake = Fake::default();
+        let d = data(&[], vec![]);
+        let err = resolve_with(
+            &fake,
+            &npu_machine("1.32.0"),
+            &d,
+            Some("2026.2"),
+            false,
+            PREBUILT,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("needs OpenVINO 2026.2"), "{err}");
+        assert!(err.contains("nothing newer than 2025.4"), "{err}");
+        assert!(err.contains("--ignore-driver"), "{err}");
+    }
+
+    #[test]
+    fn an_npu_the_data_does_not_know_is_refused_unless_a_floor_is_given() {
+        let (fake, _) = three_releases();
+        let mut machine = npu_machine("1.35.0");
+        machine.devices[0].pci_id = "0xbeef".into();
+        let d = data(&[], vec![]);
+        let err = resolve_with(&fake, &machine, &d, None, false, PREBUILT)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("NPU 0xbeef has no known floor yet"), "{err}");
+        assert!(err.contains("newer than ovfetch's data"), "{err}");
+
+        let plan = resolve_with(&fake, &machine, &d, Some("2025.4"), false, PREBUILT).unwrap();
+        assert_eq!(plan.openvino, "2025.4.1");
+        assert_eq!(plan.floor.reason, "--min-openvino");
+    }
+
+    #[test]
+    fn a_floor_that_is_not_a_version_is_an_error() {
+        let (fake, _) = three_releases();
+        let err = resolve_with(
+            &fake,
+            &no_npu(),
+            &data(&[], vec![]),
+            Some("new"),
+            false,
+            PREBUILT,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(err, r#"bad floor Some("new")"#);
+    }
+
+    #[test]
+    fn a_mirror_that_disagrees_stops_the_plan() {
+        let (mut fake, wheels) = three_releases();
+        fake.mirror_disagrees
+            .insert(wheels[0].filename.clone(), "ee".repeat(32));
+        let err = resolve_with(&fake, &no_npu(), &data(&[], vec![]), None, false, PREBUILT)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("SOURCES DISAGREE"), "{err}");
+    }
+
+    fn recipe_for(openvino_wheel: &PypiFile) -> Build {
+        Build {
+            openvino: "2026.4.1".into(),
+            openvino_wheel: openvino_wheel.ledger_id(),
+            ..recipe("1.24.1", "2026.4.1")
+        }
+    }
+
+    #[test]
+    fn a_newer_recipe_is_only_hinted_at_without_build() {
+        let (mut fake, wheels) = three_releases();
+        let ov = wheel("openvino", "2026.4.1", "cp313", "0a");
+        fake.wheels.push(ov.clone());
+        let d = data(&[&wheels[1], &ov], vec![recipe_for(&ov)]);
+        let plan = resolve_with(&fake, &npu_machine("1.35.0"), &d, None, false, PREBUILT).unwrap();
+        assert_eq!(plan.openvino, "2025.4.1");
+        assert_eq!(plan.artifact.kind, Kind::Wheel);
+        assert_eq!(
+            plan.warnings,
+            ["OpenVINO 2026.4.1 is available by compiling ONNX Runtime 1.24.1 here; pass --build"]
+        );
+    }
+
+    #[test]
+    fn with_build_the_recipe_is_planned_from_its_pinned_inputs() {
+        let (mut fake, wheels) = three_releases();
+        let ov = wheel("openvino", "2026.4.1", "cp313", "0a");
+        fake.wheels.push(ov.clone());
+        fake.tags
+            .insert("microsoft/onnxruntime v1.24.1".into(), "c0ffee".into());
+        let build = recipe_for(&ov);
+        let d = data(&[&wheels[1], &ov], vec![build.clone()]);
+        let want = Want::OnnxRuntime { allow_build: true };
+        let plan = resolve_with(&fake, &npu_machine("1.35.0"), &d, None, false, want).unwrap();
+        assert_eq!(plan.openvino, "2026.4.1");
+        assert_eq!(plan.artifact.kind, Kind::Build);
+        assert_eq!(
+            plan.artifact.id,
+            "build/onnxruntime-1.24.1+openvino-2026.4.1"
+        );
+        assert_eq!(plan.artifact.trust, Trust::Verified);
+        assert_eq!(
+            plan.artifact.sha256,
+            recipe_digest(&build, &"0a".repeat(32))
+        );
+        let input = &plan.artifact.build.as_ref().unwrap().openvino_wheel;
+        assert_eq!(
+            (input.id.as_str(), input.url.as_str()),
+            (ov.ledger_id().as_str(), ov.url.as_str())
+        );
+    }
+
+    #[test]
+    fn a_moved_release_tag_stops_a_build_plan() {
+        let (mut fake, _) = three_releases();
+        let ov = wheel("openvino", "2026.4.1", "cp313", "0a");
+        fake.wheels.push(ov.clone());
+        fake.tags
+            .insert("microsoft/onnxruntime v1.24.1".into(), "deadbeef".into());
+        let d = data(&[&ov], vec![recipe_for(&ov)]);
+        let want = Want::OnnxRuntime { allow_build: true };
+        let err = resolve_with(&fake, &npu_machine("1.35.0"), &d, None, false, want)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("A release tag moved"), "{err}");
+    }
+
+    #[test]
+    fn a_recipe_input_that_left_pypi_stops_a_build_plan() {
+        let (fake, _) = three_releases();
+        let ov = wheel("openvino", "2026.4.1", "cp313", "0a");
+        let d = data(&[&ov], vec![recipe_for(&ov)]);
+        let want = Want::OnnxRuntime { allow_build: true };
+        let err = resolve_with(&fake, &npu_machine("1.35.0"), &d, None, false, want)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is no longer on PyPI"), "{err}");
+    }
+
+    #[test]
+    fn openvino_alone_is_planned_without_onnxruntime() {
+        let ov = [
+            wheel("openvino", "2026.5.0", "cp313", "0b"),
+            wheel("openvino", "2026.4.1", "cp313", "0a"),
+        ];
+        let fake = Fake::with_wheels(ov.to_vec());
+        let d = data(&[&ov[1]], vec![]);
+        let plan = resolve_with(
+            &fake,
+            &npu_machine("1.35.0"),
+            &d,
+            None,
+            false,
+            Want::OpenvinoOnly,
+        )
+        .unwrap();
+        assert_eq!(plan.openvino, "2026.4.1");
+        assert_eq!(plan.artifact.kind, Kind::Openvino);
+        assert_eq!(plan.artifact.onnxruntime, None);
+        assert_eq!(plan.artifact.trust, Trust::Verified);
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+
+        let err = resolve_with(
+            &fake,
+            &npu_machine("1.32.0"),
+            &d,
+            None,
+            false,
+            Want::OpenvinoOnly,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err,
+            "no openvino wheel fits this device: it needs OpenVINO >= 2025.2 and <= 2025.4 (NPU driver)"
+        );
+    }
+
+    #[test]
+    fn a_driver_older_than_the_pick_needs_is_a_warning_not_a_refusal() {
+        let (fake, _) = three_releases();
+        let mut d = data(&[], vec![]);
+        d.npu_drivers.list[0].openvino = "2025.2".into();
+        let plan = resolve_with(&fake, &npu_machine("1.32.0"), &d, None, true, PREBUILT).unwrap();
+        assert_eq!(plan.openvino, "2026.5.0");
+        assert_eq!(plan.npu.driver_installed.as_deref(), Some("1.32.0"));
+        assert!(
+            plan.warnings.iter().any(
+                |w| w.contains("no NPU driver release is known to work with OpenVINO 2026.5.0")
+            ),
+            "{:?}",
+            plan.warnings
+        );
     }
 }
