@@ -1,54 +1,85 @@
-//! A private scratch directory that removes itself.
+//! Private scratch directories that remove themselves, from `tempfile`.
 
 use anyhow::{Context, Result};
-use std::fs;
-use std::os::unix::fs::DirBuilderExt;
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::fs::Permissions;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+pub(crate) use tempfile::TempDir;
 
-pub(crate) struct TempDir(pub(crate) PathBuf);
+const OWNER_ONLY: u32 = 0o700;
 
-impl TempDir {
-    /// A new directory only the current user can enter. Install runs as root
-    /// and copies what lands here into the prefix, so a path someone else
-    /// created first in /tmp is an error, not something to reuse.
-    pub(crate) fn new() -> Result<Self> {
-        Self::new_in(&std::env::temp_dir(), "ovfetch")
-    }
-
-    pub(crate) fn new_in(dir: &Path, stem: &str) -> Result<Self> {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.subsec_nanos();
-        let p = dir.join(format!("{stem}-{}-{nanos}", std::process::id()));
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&p)
-            .with_context(|| format!("creating {}", p.display()))?;
-        Ok(Self(p))
-    }
-
-    /// The path, no longer removed on drop.
-    pub(crate) fn keep(self) -> PathBuf {
-        let p = self.0.clone();
-        std::mem::forget(self);
-        p
-    }
+/// A new directory only the current user can enter. Install runs as root
+/// and copies what lands here into the prefix, so a path someone else
+/// created first in /tmp is an error, not something to reuse.
+pub(crate) fn private() -> Result<TempDir> {
+    private_in(&std::env::temp_dir(), "ovfetch")
 }
 
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
+/// The same, created in `dir` with a name that starts with `stem`.
+pub(crate) fn private_in(dir: &Path, stem: &str) -> Result<TempDir> {
+    tempfile::Builder::new()
+        .prefix(stem)
+        .permissions(Permissions::from_mode(OWNER_ONLY))
+        .tempdir_in(dir)
+        .with_context(|| format!("creating {stem} in {}", dir.display()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::fs;
 
     #[test]
     fn temp_dir_is_private() {
-        let dir = TempDir::new().unwrap();
-        let mode = fs::metadata(&dir.0).unwrap().permissions().mode();
+        let dir = private().unwrap();
+        let mode = fs::metadata(dir.path()).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn a_dir_made_beside_a_prefix_is_private_too() {
+        let parent = private().unwrap();
+        let dir = private_in(parent.path(), ".ort.ovfetch-new").unwrap();
+        let mode = fs::metadata(dir.path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        assert_eq!(dir.path().parent(), Some(parent.path()));
+        let name = dir
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(name.starts_with(".ort.ovfetch-new"), "{name}");
+    }
+
+    #[test]
+    fn two_dirs_with_one_stem_do_not_collide() {
+        let parent = private().unwrap();
+        let first = private_in(parent.path(), "stem").unwrap();
+        let second = private_in(parent.path(), "stem").unwrap();
+        assert_ne!(first.path(), second.path());
+    }
+
+    #[test]
+    fn a_missing_parent_is_an_error_not_a_fallback() {
+        let parent = private().unwrap();
+        assert!(private_in(&parent.path().join("absent"), "stem").is_err());
+    }
+
+    #[test]
+    fn the_dir_and_its_contents_go_when_it_is_dropped() {
+        let dir = private().unwrap();
+        let path = dir.path().to_owned();
+        fs::create_dir(path.join("lib")).unwrap();
+        fs::write(path.join("lib/libx.so"), b"x").unwrap();
+        drop(dir);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_kept_dir_outlives_its_guard() {
+        let parent = private().unwrap();
+        let kept = private_in(parent.path(), "old").unwrap().keep();
+        assert!(kept.is_dir());
     }
 }

@@ -30,18 +30,21 @@ pub(crate) fn sorted_file_names(dir: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tempdir::TempDir;
+    use crate::tempdir;
     use std::os::unix::fs::symlink;
 
     #[test]
     fn regular_files_leave_out_symlinks_and_directories() {
-        let dir = TempDir::new().unwrap();
-        fs::write(dir.0.join("libreal.so.1"), b"x").unwrap();
-        symlink("libreal.so.1", dir.0.join("libreal.so")).unwrap();
-        fs::create_dir(dir.0.join("nested")).unwrap();
-        assert_eq!(regular_files(&dir.0).unwrap(), [dir.0.join("libreal.so.1")]);
+        let dir = tempdir::private().unwrap();
+        fs::write(dir.path().join("libreal.so.1"), b"x").unwrap();
+        symlink("libreal.so.1", dir.path().join("libreal.so")).unwrap();
+        fs::create_dir(dir.path().join("nested")).unwrap();
         assert_eq!(
-            sorted_file_names(&dir.0),
+            regular_files(dir.path()).unwrap(),
+            [dir.path().join("libreal.so.1")]
+        );
+        assert_eq!(
+            sorted_file_names(dir.path()),
             ["libreal.so", "libreal.so.1", "nested"]
         );
     }

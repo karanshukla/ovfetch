@@ -5,7 +5,7 @@ use crate::consensus;
 use crate::data::{Data, Entry, NpuDriver, Platform};
 use crate::net;
 use crate::sources::{self, PypiFile};
-use crate::tempdir::TempDir;
+use crate::tempdir;
 use crate::version::Ver;
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
@@ -124,8 +124,8 @@ pub fn audit(data: &Data, sample: usize) -> Result<String> {
     let start = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .subsec_nanos() as usize;
-    let dir = TempDir::new()?;
-    let tmp = dir.0.join("spot");
+    let dir = tempdir::private()?;
+    let tmp = dir.path().join("spot");
     for i in 0..sample.min(spot.len()) {
         let (file, want) = &spot[(start + i * 7919) % spot.len()];
         let page = pages.get(&file.project).cloned().unwrap_or_default();

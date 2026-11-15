@@ -146,7 +146,7 @@ pub(crate) fn check_search_paths(lib: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::elf::tests::elf_with_runpath;
-    use crate::tempdir::TempDir;
+    use crate::tempdir;
     use std::path::Path;
 
     #[test]
@@ -158,9 +158,9 @@ mod tests {
             return;
         };
         assert_eq!(elf::search_paths(&libc), Some(vec![]));
-        let dir = TempDir::new().unwrap();
-        fs::write(dir.0.join("libx.so"), &libc).unwrap();
-        check_search_paths(&dir.0).unwrap();
+        let dir = tempdir::private().unwrap();
+        fs::write(dir.path().join("libx.so"), &libc).unwrap();
+        check_search_paths(dir.path()).unwrap();
     }
 
     #[test]
@@ -170,52 +170,56 @@ mod tests {
             elf::search_paths(&elf),
             Some(vec!["$ORIGIN".into(), "/home/u/build/lib".into()])
         );
-        let dir = TempDir::new().unwrap();
-        fs::write(dir.0.join("libbuilt.so.1"), &elf).unwrap();
-        let err = check_search_paths(&dir.0).unwrap_err().to_string();
+        let dir = tempdir::private().unwrap();
+        fs::write(dir.path().join("libbuilt.so.1"), &elf).unwrap();
+        let err = check_search_paths(dir.path()).unwrap_err().to_string();
         assert!(err.contains("/home/u/build/lib"), "{err}");
     }
 
     #[test]
     fn an_origin_runpath_passes() {
-        let dir = TempDir::new().unwrap();
-        fs::write(dir.0.join("libok.so"), elf_with_runpath(b"$ORIGIN/../lib")).unwrap();
-        check_search_paths(&dir.0).unwrap();
+        let dir = tempdir::private().unwrap();
+        fs::write(
+            dir.path().join("libok.so"),
+            elf_with_runpath(b"$ORIGIN/../lib"),
+        )
+        .unwrap();
+        check_search_paths(dir.path()).unwrap();
     }
 
     #[test]
     fn a_non_utf8_runpath_is_still_checked() {
-        let dir = TempDir::new().unwrap();
+        let dir = tempdir::private().unwrap();
         fs::write(
-            dir.0.join("libodd.so"),
+            dir.path().join("libodd.so"),
             elf_with_runpath(b"\xff:/home/u/build"),
         )
         .unwrap();
-        assert!(check_search_paths(&dir.0).is_err());
+        assert!(check_search_paths(dir.path()).is_err());
     }
 
     #[test]
     fn a_library_that_cannot_be_read_fails_closed() {
-        let dir = TempDir::new().unwrap();
+        let dir = tempdir::private().unwrap();
         let mut truncated = elf_with_runpath(b"/home/u/build");
         truncated.truncate(100); // cuts through the program headers
-        fs::write(dir.0.join("libcut.so.2"), truncated).unwrap();
-        assert!(check_search_paths(&dir.0).is_err());
+        fs::write(dir.path().join("libcut.so.2"), truncated).unwrap();
+        assert!(check_search_paths(dir.path()).is_err());
 
-        let dir = TempDir::new().unwrap();
-        fs::write(dir.0.join("libnot.so"), b"not elf").unwrap();
-        assert!(check_search_paths(&dir.0).is_err());
+        let dir = tempdir::private().unwrap();
+        fs::write(dir.path().join("libnot.so"), b"not elf").unwrap();
+        assert!(check_search_paths(dir.path()).is_err());
 
         // Not a library, not ELF: nothing to check.
-        let dir = TempDir::new().unwrap();
-        fs::write(dir.0.join("plugins.xml"), b"<xml/>").unwrap();
-        check_search_paths(&dir.0).unwrap();
+        let dir = tempdir::private().unwrap();
+        fs::write(dir.path().join("plugins.xml"), b"<xml/>").unwrap();
+        check_search_paths(dir.path()).unwrap();
     }
 
     #[test]
     fn unversioned_names_link_to_the_shortest_versioned_one() {
-        let dir = TempDir::new().unwrap();
-        let p = &dir.0;
+        let dir = tempdir::private().unwrap();
+        let p = dir.path();
         fs::write(p.join("libonnxruntime.so.1.24.1"), b"ort").unwrap();
         fs::write(p.join("libopenvino_c.so.2641"), b"c").unwrap();
         fs::write(p.join("libopenvino_c.so.2026.4.1"), b"other").unwrap();
@@ -236,8 +240,8 @@ mod tests {
 
     #[test]
     fn openvino_alone_needs_no_onnxruntime() {
-        let dir = TempDir::new().unwrap();
-        let p = &dir.0;
+        let dir = tempdir::private().unwrap();
+        let p = dir.path();
         fs::write(p.join("libopenvino.so.2641"), b"ov").unwrap();
         fs::write(p.join("libopenvino_c.so.2641"), b"c").unwrap();
         normalise_links(p).unwrap();

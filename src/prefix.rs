@@ -3,7 +3,7 @@
 use crate::libs;
 use crate::listing::regular_files;
 use crate::net;
-use crate::tempdir::TempDir;
+use crate::tempdir;
 use crate::version::Ver;
 use anyhow::{Context, Result, bail};
 use std::fs;
@@ -110,7 +110,7 @@ fn swap_in(staged: &Path, prefix: &Path, old_stem: &str) -> Result<()> {
     }
     let parent = prefix.parent().unwrap_or(Path::new("."));
     // Not a guard: if the restore below fails, this is the only copy left.
-    let old = TempDir::new_in(parent, old_stem)?.keep();
+    let old = tempdir::private_in(parent, old_stem)?.keep();
     fs::remove_dir(&old)?;
     fs::rename(prefix, &old).with_context(|| format!("moving {} aside", prefix.display()))?;
     if let Err(e) = fs::rename(staged, prefix) {
@@ -180,9 +180,9 @@ pub(crate) fn place(lib: &Path, prefix: &Path, lock: &serde_json::Value) -> Resu
         .file_name()
         .with_context(|| format!("{} names no directory", prefix.display()))?
         .to_string_lossy();
-    let staged = TempDir::new_in(parent, &format!(".{name}.ovfetch-new"))?;
+    let staged = tempdir::private_in(parent, &format!(".{name}.ovfetch-new"))?;
     for e in fs::read_dir(lib)?.flatten() {
-        let dest = staged.0.join(e.file_name());
+        let dest = staged.path().join(e.file_name());
         if e.path().is_symlink() {
             symlink(fs::read_link(e.path())?, dest)?;
         } else {
@@ -190,9 +190,9 @@ pub(crate) fn place(lib: &Path, prefix: &Path, lock: &serde_json::Value) -> Resu
         }
     }
     let mode = fs::metadata(prefix).map_or(0o755, |m| m.permissions().mode());
-    fs::set_permissions(&staged.0, fs::Permissions::from_mode(mode))?;
-    verify(&staged.0)?;
-    swap_in(&staged.0, prefix, &format!(".{name}.ovfetch-old"))?;
+    fs::set_permissions(staged.path(), fs::Permissions::from_mode(mode))?;
+    verify(staged.path())?;
+    swap_in(staged.path(), prefix, &format!(".{name}.ovfetch-old"))?;
     verify(prefix)?;
     Ok(prefix.clone())
 }
@@ -224,8 +224,8 @@ mod tests {
 
     #[test]
     fn verify_flags_files_it_did_not_write() {
-        let dir = TempDir::new().unwrap();
-        let p = &dir.0;
+        let dir = tempdir::private().unwrap();
+        let p = dir.path();
         fs::write(p.join("libonnxruntime.so.1.23.0"), b"ort").unwrap();
         symlink("libonnxruntime.so.1.23.0", p.join("libonnxruntime.so.1")).unwrap();
         write_sums(p).unwrap();
@@ -250,48 +250,48 @@ mod tests {
 
     #[test]
     fn a_swap_replaces_the_whole_prefix() {
-        let dir = TempDir::new().unwrap();
-        let (prefix, staged) = (dir.0.join("ort"), dir.0.join("staged"));
+        let dir = tempdir::private().unwrap();
+        let (prefix, staged) = (dir.path().join("ort"), dir.path().join("staged"));
         fs::create_dir(&prefix).unwrap();
         fs::write(prefix.join("libopenvino.so.2026.3.0"), b"old").unwrap();
         fs::create_dir(&staged).unwrap();
         fs::write(staged.join("libopenvino.so.2026.4.1"), b"new").unwrap();
         swap_in(&staged, &prefix, ".ort.ovfetch-old").unwrap();
         assert_eq!(sorted_file_names(&prefix), ["libopenvino.so.2026.4.1"]);
-        assert_eq!(sorted_file_names(&dir.0), ["ort"]);
+        assert_eq!(sorted_file_names(dir.path()), ["ort"]);
     }
 
     #[test]
     fn a_failed_swap_keeps_the_old_prefix() {
-        let dir = TempDir::new().unwrap();
-        let prefix = dir.0.join("ort");
+        let dir = tempdir::private().unwrap();
+        let prefix = dir.path().join("ort");
         fs::create_dir(&prefix).unwrap();
         fs::write(prefix.join("libopenvino.so.2026.3.0"), b"old").unwrap();
-        assert!(swap_in(&dir.0.join("missing"), &prefix, ".ort.ovfetch-old").is_err());
+        assert!(swap_in(&dir.path().join("missing"), &prefix, ".ort.ovfetch-old").is_err());
         assert_eq!(
             fs::read(prefix.join("libopenvino.so.2026.3.0")).unwrap(),
             b"old"
         );
-        assert_eq!(sorted_file_names(&dir.0), ["ort"]);
+        assert_eq!(sorted_file_names(dir.path()), ["ort"]);
     }
 
     #[test]
     fn place_replaces_a_symlinked_prefix_where_it_points() {
-        let dir = TempDir::new().unwrap();
-        let real = dir.0.join("real");
+        let dir = tempdir::private().unwrap();
+        let real = dir.path().join("real");
         fs::create_dir(&real).unwrap();
         fs::write(real.join("libopenvino.so.2026.3.0"), b"old").unwrap();
         write_sums(&real).unwrap();
         fs::set_permissions(&real, fs::Permissions::from_mode(0o750)).unwrap();
-        symlink(&real, dir.0.join("link")).unwrap();
+        symlink(&real, dir.path().join("link")).unwrap();
 
-        let lib = dir.0.join("staging");
+        let lib = dir.path().join("staging");
         fs::create_dir(&lib).unwrap();
         fs::write(lib.join("libfoo.so.1"), elf_with_runpath(b"$ORIGIN")).unwrap();
-        let got = place(&lib, &dir.0.join("link"), &serde_json::json!({})).unwrap();
+        let got = place(&lib, &dir.path().join("link"), &serde_json::json!({})).unwrap();
 
         assert_eq!(got, fs::canonicalize(&real).unwrap());
-        assert!(dir.0.join("link").is_symlink());
+        assert!(dir.path().join("link").is_symlink());
         assert_eq!(
             fs::metadata(&real).unwrap().permissions().mode() & 0o777,
             0o750
@@ -302,6 +302,6 @@ mod tests {
         );
         verify(&real).unwrap();
         // Nothing staged or set aside is left beside it.
-        assert_eq!(sorted_file_names(&dir.0), ["link", "real", "staging"]);
+        assert_eq!(sorted_file_names(dir.path()), ["link", "real", "staging"]);
     }
 }

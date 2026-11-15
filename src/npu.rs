@@ -12,7 +12,7 @@ use crate::prefix::{
     installed_npu_mode, installed_sha256, place, refuse_foreign, resolved, verify,
 };
 use crate::sources;
-use crate::tempdir::TempDir;
+use crate::tempdir;
 use crate::version::Ver;
 use anyhow::{Context, Result, bail};
 use std::fs;
@@ -313,10 +313,10 @@ pub fn install(plan: &Plan, host: &Machine, prefix: &Path, opts: &Options) -> Re
         require_ze_loader()?;
     }
 
-    let tmp = TempDir::new()?;
-    let lib = tmp.0.join("lib");
+    let tmp = tempdir::private()?;
+    let lib = tmp.path().join("lib");
     fs::create_dir_all(&lib)?;
-    let tarball = tmp.0.join("driver.tar.gz");
+    let tarball = tmp.path().join("driver.tar.gz");
     install::fetch(std::slice::from_ref(&plan.url), &plan.sha256, &tarball)?;
     let mut mode = plan.mode;
     if mode == Mode::Compiler {
@@ -485,12 +485,12 @@ mod tests {
             file(b, "./usr/lib/x86_64-linux-gnu/nested/libx.so", b"x");
             file(b, "./etc/libfake.so", b"x");
         });
-        let dir = TempDir::new().unwrap();
-        let mut got = unpack_libs(&data, &dir.0).unwrap();
+        let dir = tempdir::private().unwrap();
+        let mut got = unpack_libs(&data, dir.path()).unwrap();
         got.sort();
         assert_eq!(got, ["libze_intel_npu.so.1", "libze_intel_npu.so.1.35.0"]);
         assert_eq!(
-            fs::read_link(dir.0.join("libze_intel_npu.so.1")).unwrap(),
+            fs::read_link(dir.path().join("libze_intel_npu.so.1")).unwrap(),
             Path::new("libze_intel_npu.so.1.35.0")
         );
     }
@@ -498,17 +498,17 @@ mod tests {
     #[test]
     fn a_symlink_out_of_the_directory_is_refused() {
         let data = tar_gz(|b| link(b, "usr/lib/x86_64-linux-gnu/libz.so.1", "/etc/shadow"));
-        let dir = TempDir::new().unwrap();
-        assert!(unpack_libs(&data, &dir.0).is_err());
+        let dir = tempdir::private().unwrap();
+        assert!(unpack_libs(&data, dir.path()).is_err());
     }
 
     #[test]
     fn a_symlink_to_a_directory_is_refused() {
         for target in [".", ".."] {
             let data = tar_gz(|b| link(b, "usr/lib/x86_64-linux-gnu/libz.so.1", target));
-            let dir = TempDir::new().unwrap();
-            assert!(unpack_libs(&data, &dir.0).is_err(), "{target}");
-            assert!(fs::read_dir(&dir.0).unwrap().next().is_none());
+            let dir = tempdir::private().unwrap();
+            assert!(unpack_libs(&data, dir.path()).is_err(), "{target}");
+            assert!(fs::read_dir(dir.path()).unwrap().next().is_none());
         }
     }
 
@@ -534,10 +534,10 @@ mod tests {
                 b"sig",
             );
         });
-        let dir = TempDir::new().unwrap();
-        let tgz = dir.0.join("r.tar.gz");
+        let dir = tempdir::private().unwrap();
+        let tgz = dir.path().join("r.tar.gz");
         fs::write(&tgz, release).unwrap();
-        let out = dir.0.join("out");
+        let out = dir.path().join("out");
         fs::create_dir(&out).unwrap();
         unpack(&tgz, &[COMPILER_PKG], &out).unwrap();
         assert!(out.join("libnpu_driver_compiler.so").is_file());
@@ -631,12 +631,12 @@ mod tests {
 
     #[test]
     fn a_compiler_found_beside_the_driver_needs_the_driver_too() {
-        let dir = TempDir::new().unwrap();
+        let dir = tempdir::private().unwrap();
         for f in [
             detect::COMPILER_BESIDE_DRIVER,
             "libopenvino_intel_npu_compiler.so",
         ] {
-            fs::write(dir.0.join(f), b"").unwrap();
+            fs::write(dir.path().join(f), b"").unwrap();
         }
         let needs = vec![
             vec![
@@ -645,14 +645,14 @@ mod tests {
             ],
             vec!["libnpu_driver_compiler.so".to_string()],
         ];
-        assert_eq!(covered(&needs, &dir.0, false).unwrap(), None);
+        assert_eq!(covered(&needs, dir.path(), false).unwrap(), None);
         assert_eq!(
-            covered(&needs, &dir.0, true).unwrap().as_ref(),
+            covered(&needs, dir.path(), true).unwrap().as_ref(),
             Some(&needs[0])
         );
-        fs::write(dir.0.join("libnpu_driver_compiler.so"), b"").unwrap();
+        fs::write(dir.path().join("libnpu_driver_compiler.so"), b"").unwrap();
         assert_eq!(
-            covered(&needs, &dir.0, false).unwrap().as_ref(),
+            covered(&needs, dir.path(), false).unwrap().as_ref(),
             Some(&needs[1])
         );
     }
@@ -671,28 +671,29 @@ mod tests {
     /// A prefix `npu install` left in `mode`, plus a file it did not write,
     /// so an install that gets past the short-circuit stops at
     /// `refuse_foreign` instead of reaching the network.
-    fn npu_prefix(mode: &str) -> TempDir {
-        let dir = TempDir::new().unwrap();
-        fs::write(dir.0.join("libnpu_driver_compiler.so"), b"c").unwrap();
-        crate::prefix::write_sums(&dir.0).unwrap();
+    fn npu_prefix(mode: &str) -> tempdir::TempDir {
+        let dir = tempdir::private().unwrap();
+        fs::write(dir.path().join("libnpu_driver_compiler.so"), b"c").unwrap();
+        crate::prefix::write_sums(dir.path()).unwrap();
         fs::write(
-            dir.0.join(crate::prefix::LOCK),
+            dir.path().join(crate::prefix::LOCK),
             serde_json::json!({"mode": mode, "artifact": {"sha256": "same"}}).to_string(),
         )
         .unwrap();
         dir
     }
 
-    fn foreign(dir: &TempDir) -> &TempDir {
-        fs::write(dir.0.join("mine.txt"), b"x").unwrap();
+    fn foreign(dir: &tempdir::TempDir) -> &tempdir::TempDir {
+        fs::write(dir.path().join("mine.txt"), b"x").unwrap();
         dir
     }
 
     #[test]
     fn an_unverified_driver_release_needs_the_flag() {
-        let prefix = TempDir::new().unwrap();
+        let prefix = tempdir::private().unwrap();
         let p = npu_plan(Mode::Compiler, Trust::Unverified);
-        let err = install(&p, &host(Some("1.35.0")), &prefix.0, &opts(None, false)).unwrap_err();
+        let err =
+            install(&p, &host(Some("1.35.0")), prefix.path(), &opts(None, false)).unwrap_err();
         assert!(err.to_string().contains("--allow-unverified"), "{err}");
     }
 
@@ -702,9 +703,9 @@ mod tests {
         foreign(&prefix);
         let p = npu_plan(Mode::Compiler, Trust::Verified);
         // The foreign file breaks verify, so it is not "already installed".
-        assert!(install(&p, &host(Some("1.35.0")), &prefix.0, &opts(None, false)).is_err());
-        fs::remove_file(prefix.0.join("mine.txt")).unwrap();
-        install(&p, &host(Some("1.35.0")), &prefix.0, &opts(None, false)).unwrap();
+        assert!(install(&p, &host(Some("1.35.0")), prefix.path(), &opts(None, false)).is_err());
+        fs::remove_file(prefix.path().join("mine.txt")).unwrap();
+        install(&p, &host(Some("1.35.0")), prefix.path(), &opts(None, false)).unwrap();
     }
 
     #[test]
@@ -714,28 +715,28 @@ mod tests {
         install(
             &npu_plan(Mode::Compiler, Trust::Verified),
             &h,
-            &prefix.0,
+            prefix.path(),
             &opts(None, false),
         )
         .unwrap();
         // Past the short-circuit, a full install stops at the Level Zero
         // loader check or the offline download; either way it is an error.
         let full = npu_plan(Mode::Full, Trust::Verified);
-        assert!(install(&full, &h, &prefix.0, &opts(None, true)).is_err());
+        assert!(install(&full, &h, prefix.path(), &opts(None, true)).is_err());
     }
 
     #[test]
     fn a_host_that_finds_its_compiler_needs_nothing() {
-        let prefix = TempDir::new().unwrap();
+        let prefix = tempdir::private().unwrap();
         let mut h = host(Some("1.35.0"));
         h.npu_compiler = true;
         install(
             &npu_plan(Mode::Compiler, Trust::Verified),
             &h,
-            &prefix.0.join("npu"),
+            &prefix.path().join("npu"),
             &opts(None, false),
         )
         .unwrap();
-        assert!(!prefix.0.join("npu").exists());
+        assert!(!prefix.path().join("npu").exists());
     }
 }

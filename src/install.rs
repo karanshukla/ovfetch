@@ -7,7 +7,7 @@ use crate::net;
 pub use crate::prefix::{installed_openvino, verify};
 use crate::prefix::{installed_sha256, place, refuse_foreign};
 use crate::resolve::{Kind, Plan};
-use crate::tempdir::TempDir;
+use crate::tempdir;
 use crate::version::Ver;
 use anyhow::{Context, Result, bail};
 use std::fs;
@@ -122,8 +122,8 @@ pub fn install(
         return Ok(());
     }
     refuse_foreign(prefix)?;
-    let tmp = TempDir::new()?;
-    let lib = tmp.0.join("lib");
+    let tmp = tempdir::private()?;
+    let lib = tmp.path().join("lib");
     fs::create_dir_all(&lib)?;
 
     let fetch_input = |id: &str, url: &str, sha256: &str, dest: &Path| {
@@ -136,7 +136,7 @@ pub fn install(
     let mut lock = serde_json::to_value(plan)?;
     match plan.artifact.kind {
         Kind::Wheel => {
-            let whl = tmp.0.join("ort.whl");
+            let whl = tmp.path().join("ort.whl");
             fetch_input(
                 &plan.artifact.id,
                 &plan.artifact.url,
@@ -151,7 +151,7 @@ pub fn install(
             )?;
         }
         Kind::Openvino => {
-            let whl = tmp.0.join("openvino.whl");
+            let whl = tmp.path().join("openvino.whl");
             fetch_input(
                 &plan.artifact.id,
                 &plan.artifact.url,
@@ -204,10 +204,10 @@ mod tests {
     use crate::listing::sorted_file_names;
     use crate::prefix::{LOCK, write_sums};
 
-    fn zip_of(entries: &[(&str, &[u8])]) -> TempDir {
+    fn zip_of(entries: &[(&str, &[u8])]) -> tempdir::TempDir {
         use std::io::Write;
-        let dir = TempDir::new().unwrap();
-        let mut w = zip::ZipWriter::new(fs::File::create(dir.0.join("a.whl")).unwrap());
+        let dir = tempdir::private().unwrap();
+        let mut w = zip::ZipWriter::new(fs::File::create(dir.path().join("a.whl")).unwrap());
         for (name, data) in entries {
             w.start_file(*name, zip::write::SimpleFileOptions::default())
                 .unwrap();
@@ -224,10 +224,10 @@ mod tests {
             ("/abs/libabs.so", b"x"),
             ("onnxruntime/capi/libok.so", b"ok"),
         ]);
-        let dest = zip.0.join("out");
+        let dest = zip.path().join("out");
         fs::create_dir(&dest).unwrap();
-        unzip(&zip.0.join("a.whl"), &dest, |_| true, false).unwrap();
-        assert_eq!(sorted_file_names(&zip.0), ["a.whl", "out"]);
+        unzip(&zip.path().join("a.whl"), &dest, |_| true, false).unwrap();
+        assert_eq!(sorted_file_names(zip.path()), ["a.whl", "out"]);
         // `enclosed_name` keeps an absolute path, re-rooted under dest.
         assert!(!Path::new("/abs/libabs.so").exists());
         assert_eq!(
@@ -239,19 +239,19 @@ mod tests {
     #[test]
     fn a_flattened_name_collision_is_an_error() {
         let zip = zip_of(&[("a/libx.so", b"first"), ("b/libx.so", b"second")]);
-        let dest = zip.0.join("out");
+        let dest = zip.path().join("out");
         fs::create_dir(&dest).unwrap();
-        let err = unzip(&zip.0.join("a.whl"), &dest, |_| true, true).unwrap_err();
+        let err = unzip(&zip.path().join("a.whl"), &dest, |_| true, true).unwrap_err();
         assert!(format!("{err:#}").contains("b/libx.so"), "{err:#}");
         assert_eq!(fs::read(dest.join("libx.so")).unwrap(), b"first");
     }
 
     #[test]
     fn a_hash_mismatch_aborts_without_trying_the_next_mirror() {
-        let dir = TempDir::new().unwrap();
+        let dir = tempdir::private().unwrap();
         let tried = std::cell::RefCell::new(Vec::new());
         let urls = ["https://a/x".to_owned(), "https://b/x".to_owned()];
-        let err = fetch_with(&urls, "good", &dir.0.join("x"), |url, _| {
+        let err = fetch_with(&urls, "good", &dir.path().join("x"), |url, _| {
             tried.borrow_mut().push(url.to_owned());
             Ok("tampered".into())
         })
@@ -262,19 +262,19 @@ mod tests {
 
     #[test]
     fn only_a_transport_error_falls_through_to_the_next_mirror() {
-        let dir = TempDir::new().unwrap();
+        let dir = tempdir::private().unwrap();
         let urls = ["https://a/x".to_owned(), "https://b/x".to_owned()];
         let dl = |url: &str, _: &Path| match url {
             "https://a/x" => bail!("connection refused"),
             _ => Ok("good".to_owned()),
         };
-        fetch_with(&urls, "good", &dir.0.join("x"), dl).unwrap();
+        fetch_with(&urls, "good", &dir.path().join("x"), dl).unwrap();
 
         let all_down = |url: &str, _: &Path| -> Result<String> { bail!("{url} is down") };
-        let err = fetch_with(&urls, "good", &dir.0.join("x"), all_down).unwrap_err();
+        let err = fetch_with(&urls, "good", &dir.path().join("x"), all_down).unwrap_err();
         assert_eq!(err.to_string(), "https://b/x is down");
 
-        let err = fetch_with(&[], "good", &dir.0.join("x"), all_down).unwrap_err();
+        let err = fetch_with(&[], "good", &dir.path().join("x"), all_down).unwrap_err();
         assert!(err.to_string().contains("no source"), "{err}");
     }
 
@@ -318,12 +318,12 @@ mod tests {
     }
 
     /// A prefix as ovfetch leaves it: one library, its sums, and a lock.
-    fn installed(openvino: &str, sha256: &str) -> TempDir {
-        let dir = TempDir::new().unwrap();
-        fs::write(dir.0.join("libopenvino.so.2026.4.1"), b"ov").unwrap();
-        write_sums(&dir.0).unwrap();
+    fn installed(openvino: &str, sha256: &str) -> tempdir::TempDir {
+        let dir = tempdir::private().unwrap();
+        fs::write(dir.path().join("libopenvino.so.2026.4.1"), b"ov").unwrap();
+        write_sums(dir.path()).unwrap();
         fs::write(
-            dir.0.join(LOCK),
+            dir.path().join(LOCK),
             serde_json::json!({"openvino": openvino, "artifact": {"sha256": sha256}}).to_string(),
         )
         .unwrap();
@@ -335,7 +335,7 @@ mod tests {
         let prefix = installed("2026.4.1", "old");
         let p = plan("2026.3.0", "new", Trust::Verified);
         let no_fetch = |_: &str| -> Vec<String> { panic!("fetched") };
-        let err = install(&p, &prefix.0, &options(), no_fetch).unwrap_err();
+        let err = install(&p, prefix.path(), &options(), no_fetch).unwrap_err();
         assert!(err.to_string().contains("--allow-downgrade"), "{err}");
 
         // Allowed, it moves on to the next gate.
@@ -344,26 +344,26 @@ mod tests {
             allow_downgrade: true,
             ..options()
         };
-        let err = install(&p, &prefix.0, &opts, no_fetch).unwrap_err();
+        let err = install(&p, prefix.path(), &opts, no_fetch).unwrap_err();
         assert!(err.to_string().contains("--allow-unverified"), "{err}");
     }
 
     #[test]
     fn an_unverified_artifact_needs_the_flag() {
-        let prefix = TempDir::new().unwrap();
+        let prefix = tempdir::private().unwrap();
         let p = plan("2026.4.1", "new", Trust::Unverified);
         let no_fetch = |_: &str| -> Vec<String> { panic!("fetched") };
-        let err = install(&p, &prefix.0.join("ort"), &options(), no_fetch).unwrap_err();
+        let err = install(&p, &prefix.path().join("ort"), &options(), no_fetch).unwrap_err();
         assert!(err.to_string().contains("--allow-unverified"), "{err}");
-        assert!(!prefix.0.join("ort").exists());
+        assert!(!prefix.path().join("ort").exists());
     }
 
     #[test]
     fn a_matching_intact_install_is_left_alone() {
         let prefix = installed("2026.4.1", "same");
         let p = plan("2026.4.1", "same", Trust::Verified);
-        install(&p, &prefix.0, &options(), |_| panic!("fetched")).unwrap();
-        verify(&prefix.0).unwrap();
+        install(&p, prefix.path(), &options(), |_| panic!("fetched")).unwrap();
+        verify(prefix.path()).unwrap();
     }
 
     /// Runs install expecting it to go past every gate to the download, which
@@ -387,13 +387,13 @@ mod tests {
             force: true,
             ..options()
         };
-        reaches_the_download(&p, &prefix.0, &force);
+        reaches_the_download(&p, prefix.path(), &force);
 
-        fs::write(prefix.0.join("libopenvino.so.2026.4.1"), b"changed").unwrap();
-        reaches_the_download(&p, &prefix.0, &options());
+        fs::write(prefix.path().join("libopenvino.so.2026.4.1"), b"changed").unwrap();
+        reaches_the_download(&p, prefix.path(), &options());
         // The failed download left the prefix as it was.
         assert_eq!(
-            fs::read(prefix.0.join("libopenvino.so.2026.4.1")).unwrap(),
+            fs::read(prefix.path().join("libopenvino.so.2026.4.1")).unwrap(),
             b"changed"
         );
     }
@@ -401,10 +401,10 @@ mod tests {
     #[test]
     fn a_prefix_with_foreign_files_is_refused_and_left_intact() {
         let prefix = installed("2026.4.1", "old");
-        fs::write(prefix.0.join("notes.txt"), b"mine").unwrap();
+        fs::write(prefix.path().join("notes.txt"), b"mine").unwrap();
         let p = plan("2026.4.1", "new", Trust::Verified);
-        let err = install(&p, &prefix.0, &options(), |_| panic!("fetched")).unwrap_err();
+        let err = install(&p, prefix.path(), &options(), |_| panic!("fetched")).unwrap_err();
         assert!(err.to_string().contains("notes.txt"), "{err}");
-        assert_eq!(fs::read(prefix.0.join("notes.txt")).unwrap(), b"mine");
+        assert_eq!(fs::read(prefix.path().join("notes.txt")).unwrap(), b"mine");
     }
 }
