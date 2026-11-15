@@ -35,3 +35,5 @@ pub mod resolve;
 pub mod sources;
 #[cfg(feature = "cli")]
 mod tempdir;
+#[cfg(feature = "cli")]
+pub mod upstream;

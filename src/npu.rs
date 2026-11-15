@@ -11,8 +11,8 @@ use crate::listing::file_names;
 use crate::prefix::{
     installed_npu_mode, installed_sha256, place, refuse_foreign, resolved, verify,
 };
-use crate::sources;
 use crate::tempdir;
+use crate::upstream::{Network, Upstream};
 use crate::version::Ver;
 use anyhow::{Context, Result, bail};
 use std::fs;
@@ -130,6 +130,16 @@ fn tarball(data: &Data, version: &str) -> Option<String> {
 }
 
 pub fn plan(host: &Machine, data: &Data, opts: &Options) -> Result<Plan> {
+    plan_with(&Network, host, data, opts)
+}
+
+/// [`plan`] against any [`Upstream`].
+pub fn plan_with(
+    upstream: &dyn Upstream,
+    host: &Machine,
+    data: &Data,
+    opts: &Options,
+) -> Result<Plan> {
     let (version, mode) = choose(host, data, opts)?;
     let tag = format!("v{version}");
     let (id, sha256, trust) = match tarball(data, &version) {
@@ -145,7 +155,8 @@ pub fn plan(host: &Machine, data: &Data, opts: &Options) -> Result<Plan> {
         None => {
             // GitHub is the only source for these assets, so there is no
             // quorum to fall back on: an unrecorded one is GitHub's word alone.
-            let release = sources::github_release(NPU_DRIVER_REPO, &tag)
+            let release = upstream
+                .github_release(NPU_DRIVER_REPO, &tag)
                 .with_context(|| format!("looking up NPU driver release {tag}"))?;
             let mut assets: Vec<_> = release
                 .assets
@@ -646,6 +657,39 @@ mod tests {
             )
         );
         assert!(plan(&host(Some("1.32.0")), &data, &opts(Some("1.38.0"), false)).is_err());
+    }
+
+    #[test]
+    fn a_release_the_ledger_has_not_recorded_is_githubs_word_alone() {
+        use crate::sources::{GithubAsset, GithubRelease};
+        use crate::upstream::fake::Fake;
+        let asset = |name: &str, seed: &str| GithubAsset {
+            name: name.into(),
+            sha256: seed.repeat(32),
+        };
+        let mut fake = Fake::default();
+        fake.releases.insert(
+            NPU_DRIVER_REPO.into(),
+            vec![GithubRelease {
+                tag: "v9.9.0".into(),
+                url: String::new(),
+                body: String::new(),
+                assets: vec![
+                    asset("linux-npu-driver-v9.9.0-ubuntu2204.tar.gz", "22"),
+                    asset("linux-npu-driver-v9.9.0-ubuntu2404.tar.gz", "24"),
+                    asset("notes.txt", "00"),
+                ],
+            }],
+        );
+        let data = Data::load(None).unwrap();
+        let p = plan_with(&fake, &host(Some("9.9.0")), &data, &opts(None, false)).unwrap();
+        assert_eq!(p.trust, Trust::Unverified);
+        assert_eq!(p.sha256, "24".repeat(32));
+        assert_eq!(
+            p.url,
+            "https://github.com/intel/linux-npu-driver/releases/download/v9.9.0/linux-npu-driver-v9.9.0-ubuntu2404.tar.gz"
+        );
+        assert!(plan_with(&fake, &host(Some("9.8.0")), &data, &opts(None, false)).is_err());
     }
 
     #[test]
