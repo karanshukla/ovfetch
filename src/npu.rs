@@ -175,18 +175,20 @@ pub fn plan(host: &Machine, data: &Data, opts: &Options) -> Result<Plan> {
 }
 
 /// The bytes of member `name` in an `ar` archive, the container a `.deb` is.
-fn ar_member<'a>(ar: &'a [u8], name: &str) -> Result<&'a [u8]> {
-    let mut rest = ar.strip_prefix(b"!<arch>\n").context("not an ar archive")?;
-    while rest.len() >= 60 {
-        let (header, body) = rest.split_at(60);
-        let field =
-            |r: std::ops::Range<usize>| String::from_utf8_lossy(&header[r]).trim().to_owned();
-        let size: usize = field(48..58).parse().context("bad ar member size")?;
-        let data = body.get(..size).context("truncated ar member")?;
-        if field(0..16).trim_end_matches('/') == name {
-            return Ok(data);
+/// A member shorter than its header says is an error, not a short read.
+fn ar_member(archive: &[u8], name: &str) -> Result<Vec<u8>> {
+    let mut archive = ar::Archive::new(archive);
+    while let Some(member) = archive.next_entry() {
+        let mut member = member.context("not a readable ar archive")?;
+        if member.header().identifier() != name.as_bytes() {
+            continue;
         }
-        rest = body.get(size + size % 2..).unwrap_or_default();
+        let mut bytes = Vec::new();
+        member.read_to_end(&mut bytes)?;
+        if bytes.len() as u64 != member.header().size() {
+            bail!("truncated ar member {name}");
+        }
+        return Ok(bytes);
     }
     bail!("no {name} in the package")
 }
@@ -247,7 +249,7 @@ fn unpack(tarball: &Path, packages: &[&str], dest: &Path) -> Result<()> {
         let mut deb = Vec::new();
         entry.read_to_end(&mut deb)?;
         let libs = unpack_libs(
-            ar_member(&deb, "data.tar.gz").context(name.to_owned())?,
+            &ar_member(&deb, "data.tar.gz").context(name.to_owned())?,
             dest,
         )?;
         if libs.is_empty() {
@@ -466,6 +468,39 @@ mod tests {
         assert_eq!(ar_member(&deb, "data.tar.gz").unwrap(), b"payload");
         assert!(ar_member(&deb, "data.tar.zst").is_err());
         assert!(ar_member(b"not an archive", "data.tar.gz").is_err());
+    }
+
+    #[test]
+    fn a_member_is_found_with_or_without_the_gnu_trailing_slash() {
+        let gnu = ar(&[("data.tar.gz", b"payload")]);
+        assert_eq!(ar_member(&gnu, "data.tar.gz").unwrap(), b"payload");
+        let bsd = [
+            b"!<arch>\n".as_slice(),
+            format!(
+                "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+                "data.tar.gz", 0, 0, 0, 644, 7
+            )
+            .as_bytes(),
+            b"payload\n",
+        ]
+        .concat();
+        assert_eq!(ar_member(&bsd, "data.tar.gz").unwrap(), b"payload");
+    }
+
+    #[test]
+    fn a_truncated_or_malformed_package_is_an_error() {
+        let whole = ar(&[("debian-binary", b"2.0\n"), ("data.tar.gz", b"payload")]);
+        let cut_in_the_member = &whole[..whole.len() - 3];
+        assert!(ar_member(cut_in_the_member, "data.tar.gz").is_err());
+        let cut_in_the_header = &whole[..8 + 60 + 4 + 30];
+        assert!(ar_member(cut_in_the_header, "data.tar.gz").is_err());
+
+        let mut bad_size = ar(&[("data.tar.gz", b"payload")]);
+        bad_size[8 + 48..8 + 58].copy_from_slice(b"seven     ");
+        assert!(ar_member(&bad_size, "data.tar.gz").is_err());
+
+        assert!(ar_member(b"!<arch>\n", "data.tar.gz").is_err());
+        assert!(ar_member(b"", "data.tar.gz").is_err());
     }
 
     #[test]
