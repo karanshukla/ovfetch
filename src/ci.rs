@@ -336,54 +336,57 @@ pub fn discover(data: &mut Data) -> Result<String> {
 /// [`discover`] against any [`Upstream`], on a given day.
 pub fn discover_with(upstream: &dyn Upstream, data: &mut Data, today: Date) -> Result<String> {
     let mut changes = Vec::new();
+    let held = record_wheels(upstream, data, today, &mut changes)?;
+    record_npu_drivers(upstream, data, today, &mut changes)?;
+    record_platforms(upstream, data, &mut changes)?;
+    update_floors(data, &mut changes);
+    if !changes.is_empty() && !held.is_empty() {
+        changes.push(format!("\nHeld back by the {COOLDOWN_DAYS}-day cooldown:"));
+        changes.extend(held);
+    }
+    Ok(changes.join("\n"))
+}
 
+/// Records every tracked wheel that is past the cooldown and that all
+/// sources agree on. Returns a line for each wheel still inside it.
+fn record_wheels(
+    upstream: &dyn Upstream,
+    data: &mut Data,
+    today: Date,
+    changes: &mut Vec<String>,
+) -> Result<Vec<String>> {
     let cutoff = days_before(today, COOLDOWN_DAYS).to_string();
-    let intel = upstream.github_releases(INTEL_ORT_REPO)?;
+    let intel_releases = upstream.github_releases(INTEL_ORT_REPO)?;
     let mut held = Vec::new();
     for (project, min) in TRACKED {
         let pages = upstream.mirror_pages(project);
         let attested = upstream.pypi_provenance(project)?;
-        for w in tracked_wheels(upstream, project, min)? {
-            let id = w.ledger_id();
-            let has_provenance = attested.contains(&w.filename);
-            if let Some(e) = data.ledger.list.iter_mut().find(|e| e.id == id) {
-                if has_provenance && !e.provenance {
-                    e.provenance = true;
+        for wheel in tracked_wheels(upstream, project, min)? {
+            let id = wheel.ledger_id();
+            let has_provenance = attested.contains(&wheel.filename);
+            if let Some(entry) = data.ledger.list.iter_mut().find(|e| e.id == id) {
+                if has_provenance && !entry.provenance {
+                    entry.provenance = true;
                     changes.push(format!(
                         "- **PyPI now publishes provenance for `{id}`.** ovfetch does not verify it yet; that is the next thing to build."
                     ));
                 }
                 continue;
             }
-            if w.uploaded.as_str() > cutoff.as_str() {
+            if wheel.uploaded.as_str() > cutoff.as_str() {
                 held.push(format!(
                     "- `{id}` (uploaded {}), recorded once it is {COOLDOWN_DAYS} days old",
-                    w.uploaded
+                    wheel.uploaded
                 ));
                 continue;
             }
-            // A new release still has to clear the same agreement bar as an install.
+            // A new release has to clear the same agreement bar as an install.
             let (digest, _) =
-                consensus::agree(&id, &sources::pypi_claims(&w, &pages), &data.ledger)?;
-            // Only onnxruntime-openvino wheels have an intel/onnxruntime release to match.
-            let origin = if *project == "onnxruntime-openvino" {
-                let needle = format!("onnxruntime {}", w.version);
-                match intel
-                    .iter()
-                    .find(|r| r.body.to_lowercase().contains(&needle))
-                {
-                    Some(r) => format!(", Intel release [{}]({})", r.tag, r.url),
-                    None => format!(
-                        ", **no {INTEL_ORT_REPO} release mentions ONNX Runtime {}; check before merging**",
-                        w.version
-                    ),
-                }
-            } else {
-                String::new()
-            };
+                consensus::agree(&id, &sources::pypi_claims(&wheel, &pages), &data.ledger)?;
             changes.push(format!(
-                "- ledger: `{id}` = `{digest}`, uploaded {}{origin}{}",
-                w.uploaded,
+                "- ledger: `{id}` = `{digest}`, uploaded {}{}{}",
+                wheel.uploaded,
+                intel_origin(&wheel, &intel_releases),
                 if has_provenance {
                     ", PyPI provenance published"
                 } else {
@@ -398,20 +401,49 @@ pub fn discover_with(upstream: &dyn Upstream, data: &mut Data, today: Date) -> R
             });
         }
     }
+    Ok(held)
+}
 
-    let mut drivers = upstream.github_releases(NPU_DRIVER_REPO)?;
-    drivers.sort_by_key(|r| Ver::parse(&r.tag));
-    for r in &drivers {
-        let (platforms, openvino) = parse_driver_notes(&r.body);
-        let (Some(version), Some(openvino)) = (Ver::parse(&r.tag), openvino) else {
+/// The intel/onnxruntime release an onnxruntime-openvino wheel was built
+/// from, as report text. Other projects have no such release to match.
+fn intel_origin(wheel: &PypiFile, intel_releases: &[GithubRelease]) -> String {
+    if wheel.project != "onnxruntime-openvino" {
+        return String::new();
+    }
+    let needle = format!("onnxruntime {}", wheel.version);
+    match intel_releases
+        .iter()
+        .find(|r| r.body.to_lowercase().contains(&needle))
+    {
+        Some(r) => format!(", Intel release [{}]({})", r.tag, r.url),
+        None => format!(
+            ", **no {INTEL_ORT_REPO} release mentions ONNX Runtime {}; check before merging**",
+            wheel.version
+        ),
+    }
+}
+
+/// Records each NPU driver release whose notes name an OpenVINO, oldest
+/// first, and the digest of every asset it ships.
+fn record_npu_drivers(
+    upstream: &dyn Upstream,
+    data: &mut Data,
+    today: Date,
+    changes: &mut Vec<String>,
+) -> Result<()> {
+    let mut releases = upstream.github_releases(NPU_DRIVER_REPO)?;
+    releases.sort_by_key(|r| Ver::parse(&r.tag));
+    for release in &releases {
+        let (platforms, openvino) = parse_driver_notes(&release.body);
+        let (Some(version), Some(openvino)) = (Ver::parse(&release.tag), openvino) else {
             continue;
         };
-        if !data
+        let known = data
             .npu_drivers
             .list
             .iter()
-            .any(|d| Ver::parse(&d.version).as_ref() == Some(&version))
-        {
+            .any(|d| Ver::parse(&d.version).as_ref() == Some(&version));
+        if !known {
             changes.push(format!(
                 "- NPU driver {version}: OpenVINO {openvino}, verified on {}",
                 platforms.join(", ")
@@ -424,88 +456,101 @@ pub fn discover_with(upstream: &dyn Upstream, data: &mut Data, today: Date) -> R
                 measured_note: None,
             });
         }
-        for a in &r.assets {
+        for asset in &release.assets {
             record(
                 data,
-                format!("github/{NPU_DRIVER_REPO}/{}/{}", r.tag, a.name),
-                a.sha256.clone(),
+                format!("github/{NPU_DRIVER_REPO}/{}/{}", release.tag, asset.name),
+                asset.sha256.clone(),
                 today,
-                &mut changes,
+                changes,
             );
         }
     }
     data.npu_drivers
         .list
         .sort_by_key(|d| Ver::parse(&d.version));
+    Ok(())
+}
 
-    let header = upstream.github_raw(KERNEL_REPO, KERNEL_BRANCH, IVPU_HEADER)?;
-    for line in header.lines() {
+/// `(kernel name, PCI id)` for each `#define PCI_DEVICE_ID_<name> <id>` line.
+fn ivpu_pci_ids(header: &str) -> impl Iterator<Item = (&str, &str)> {
+    header.lines().filter_map(|line| {
         let mut words = line.split_whitespace();
         let (Some("#define"), Some(name), Some(id)) = (words.next(), words.next(), words.next())
         else {
-            continue;
+            return None;
         };
-        let Some(kernel_name) = name.strip_prefix("PCI_DEVICE_ID_") else {
-            continue;
-        };
-        if !data.platforms.list.iter().any(|p| p.pci_id == id) {
-            let codename = CODENAMES
-                .iter()
-                .find(|(k, _)| *k == kernel_name)
-                .map(|(_, c)| c.to_string())
-                .unwrap_or_default();
-            changes.push(format!(
-                "- new NPU platform `{id}` ({kernel_name}){}",
-                if codename.is_empty() {
-                    ": **codename unknown, fill it in before merging**".to_owned()
-                } else {
-                    format!(" = {codename}")
-                }
-            ));
-            data.platforms.list.push(Platform {
-                pci_id: id.to_owned(),
-                kernel_name: kernel_name.to_owned(),
-                codename,
-                min_openvino: None,
-                min_npu_driver: None,
-                pinned_note: None,
-            });
-        }
-    }
+        Some((name.strip_prefix("PCI_DEVICE_ID_")?, id))
+    })
+}
 
-    // A platform's floor is the pairing of the first driver release verified on it.
-    for p in data
+/// Adds every NPU PCI ID the kernel's `ivpu` driver binds and the data lacks.
+fn record_platforms(
+    upstream: &dyn Upstream,
+    data: &mut Data,
+    changes: &mut Vec<String>,
+) -> Result<()> {
+    let header = upstream.github_raw(KERNEL_REPO, KERNEL_BRANCH, IVPU_HEADER)?;
+    for (kernel_name, id) in ivpu_pci_ids(&header) {
+        if data.platforms.list.iter().any(|p| p.pci_id == id) {
+            continue;
+        }
+        let codename = CODENAMES
+            .iter()
+            .find(|(k, _)| *k == kernel_name)
+            .map(|(_, c)| c.to_string())
+            .unwrap_or_default();
+        changes.push(format!(
+            "- new NPU platform `{id}` ({kernel_name}){}",
+            if codename.is_empty() {
+                ": **codename unknown, fill it in before merging**".to_owned()
+            } else {
+                format!(" = {codename}")
+            }
+        ));
+        data.platforms.list.push(Platform {
+            pci_id: id.to_owned(),
+            kernel_name: kernel_name.to_owned(),
+            codename,
+            min_openvino: None,
+            min_npu_driver: None,
+            pinned_note: None,
+        });
+    }
+    Ok(())
+}
+
+/// A platform's floor is the pairing of the first driver release verified on
+/// it. A floor pinned by hand, or a platform with no codename, is left alone.
+fn update_floors(data: &mut Data, changes: &mut Vec<String>) {
+    for platform in data
         .platforms
         .list
         .iter_mut()
         .filter(|p| p.pinned_note.is_none() && !p.codename.is_empty())
     {
-        let Some(first) = data
+        let Some(first_driver) = data
             .npu_drivers
             .list
             .iter()
-            .find(|d| d.platforms.contains(&p.codename))
+            .find(|d| d.platforms.contains(&platform.codename))
         else {
             continue;
         };
-        let ov = Ver::parse(&first.openvino).map(|v| v.minor().to_string());
-        if p.min_openvino != ov || p.min_npu_driver.as_deref() != Some(first.version.as_str()) {
+        let openvino = Ver::parse(&first_driver.openvino).map(|v| v.minor().to_string());
+        if platform.min_openvino != openvino
+            || platform.min_npu_driver.as_deref() != Some(first_driver.version.as_str())
+        {
             changes.push(format!(
                 "- {} floor: OpenVINO {} with NPU driver {}",
-                p.codename,
-                ov.as_deref().unwrap_or("?"),
-                first.version
+                platform.codename,
+                openvino.as_deref().unwrap_or("?"),
+                first_driver.version
             ));
-            p.min_openvino = ov;
-            p.min_npu_driver = Some(first.version.clone());
+            platform.min_openvino = openvino;
+            platform.min_npu_driver = Some(first_driver.version.clone());
         }
     }
-
-    if !changes.is_empty() && !held.is_empty() {
-        changes.push(format!("\nHeld back by the {COOLDOWN_DAYS}-day cooldown:"));
-        changes.extend(held);
-    }
-    Ok(changes.join("\n"))
 }
 
 #[cfg(test)]
