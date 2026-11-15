@@ -168,48 +168,65 @@ pub fn machine() -> Machine {
 /// This machine, counting the NPU prefix at `npu_prefix` (if it holds a
 /// preload list). `None` looks at the host alone.
 pub fn machine_with(npu_prefix: Option<&Path>) -> Machine {
-    let devices = intel_devices(Path::new("/sys/bus/pci/devices"));
-    let ldconfig = ldconfig_cache();
+    machine_from(Path::new(PCI_DEVICES), &ldconfig_cache(), npu_prefix)
+}
+
+const PCI_DEVICES: &str = "/sys/bus/pci/devices";
+
+/// The machine as read from a sysfs PCI directory, `ldconfig -p` output and
+/// an optional NPU prefix. The driver files those name are read from disk.
+fn machine_from(pci_devices: &Path, ldconfig: &str, npu_prefix: Option<&Path>) -> Machine {
     let npu_prefix = npu_prefix.filter(|p| p.join(NPU_PRELOAD).is_file());
-    let in_prefix: Vec<String> = npu_prefix
-        .and_then(|p| fs::read_dir(p).ok())
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    let host_driver = || {
-        ldconfig
-            .lines()
-            .find(|l| l.trim_start().starts_with(&format!("{NPU_DRIVER} ")))
-            .and_then(|l| l.rsplit(' ').next())
-            .and_then(|p| fs::canonicalize(p).ok())
-    };
+    let in_prefix = npu_prefix.map(file_names).unwrap_or_default();
     let prefix_driver = npu_prefix
         .filter(|_| in_prefix.iter().any(|n| n == NPU_DRIVER))
         .and_then(|p| fs::canonicalize(p.join(NPU_DRIVER)).ok());
     let has_prefix_driver = prefix_driver.is_some();
-    let driver_path = prefix_driver.or_else(host_driver);
-    let npu_driver = driver_path.as_deref().and_then(driver_version);
-    let npu_compiler_needs = driver_path
+    let driver_file = prefix_driver.or_else(|| host_driver_file(ldconfig));
+    let npu_driver = driver_file.as_deref().and_then(driver_version);
+    let npu_compiler_needs = driver_file
         .and_then(|p| fs::read(p).ok())
         .map(|b| compiler_needs(&b))
         .unwrap_or_default();
-    let mut found = sonames(&ldconfig);
-    found.extend(
-        in_prefix
-            .iter()
-            .map(String::as_str)
-            .filter(|n| has_prefix_driver || *n != COMPILER_BESIDE_DRIVER),
-    );
-    let npu_compiler = compiler_present(&npu_compiler_needs, &found);
+    let mut loadable = sonames(ldconfig);
+    loadable.extend(loadable_from_prefix(&in_prefix, has_prefix_driver));
     Machine {
-        devices,
+        devices: intel_devices(pci_devices),
         npu_driver,
-        npu_compiler,
+        npu_compiler: compiler_present(&npu_compiler_needs, &loadable),
         npu_compiler_needs,
         npu_prefix: npu_prefix.map(|p| p.display().to_string()),
     }
+}
+
+fn file_names(dir: &Path) -> Vec<String> {
+    fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// The real file behind the host's driver soname, from its `ldconfig -p` line.
+fn host_driver_file(ldconfig: &str) -> Option<PathBuf> {
+    ldconfig
+        .lines()
+        .find(|l| l.trim_start().starts_with(&format!("{NPU_DRIVER} ")))
+        .and_then(|l| l.rsplit(' ').next())
+        .and_then(|p| fs::canonicalize(p).ok())
+}
+
+/// What an app that preloads the prefix can load from it. Without the
+/// prefix's own driver, [`COMPILER_BESIDE_DRIVER`] is left out.
+fn loadable_from_prefix(
+    in_prefix: &[String],
+    has_prefix_driver: bool,
+) -> impl Iterator<Item = &str> {
+    in_prefix
+        .iter()
+        .map(String::as_str)
+        .filter(move |n| has_prefix_driver || *n != COMPILER_BESIDE_DRIVER)
 }
 
 #[cfg(test)]
@@ -256,6 +273,135 @@ mod tests {
             ]
         );
         assert!(intel_devices(&sysfs).is_empty());
+    }
+
+    /// A scratch directory that is removed when the guard drops. `tempfile`
+    /// is a `cli` dependency, and this module builds without it.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("ovfetch-detect-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+
+        /// Installs a driver of `version` whose binary names `compiler_names`,
+        /// with its soname symlink, and returns the symlink.
+        fn driver(&self, dir: &str, version: &str, compiler_names: &str) -> PathBuf {
+            let dir = self.0.join(dir);
+            fs::create_dir_all(&dir).unwrap();
+            let real = format!("{NPU_DRIVER_FILE_PREFIX}{version}");
+            fs::write(dir.join(&real), compiler_names).unwrap();
+            std::os::unix::fs::symlink(&real, dir.join(NPU_DRIVER)).unwrap();
+            dir.join(NPU_DRIVER)
+        }
+
+        fn prefix(&self, files: &[&str]) -> PathBuf {
+            let dir = self.0.join("prefix");
+            fs::create_dir_all(&dir).unwrap();
+            for file in files {
+                fs::write(dir.join(file), b"").unwrap();
+            }
+            dir
+        }
+
+        fn machine(&self, ldconfig: &str, prefix: Option<&Path>) -> Machine {
+            machine_from(&self.0.join("no-sysfs"), ldconfig, prefix)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn ldconfig_with(entries: &[(&str, &Path)]) -> String {
+        let mut out = format!("{} libs found in cache `/etc/ld.so.cache'\n", entries.len());
+        for (soname, path) in entries {
+            out.push_str(&format!(
+                "\t{soname} (libc6,x86-64) => {}\n",
+                path.display()
+            ));
+        }
+        out
+    }
+
+    const NAMES_1_32: &str = "\0libnpu_driver_compiler.so\0";
+    const NAMES_1_35: &str =
+        "\0libopenvino_intel_npu_compiler_l\0oader.so\0libnpu_driver_compiler.so\0";
+    const LOADER: &str = "libopenvino_intel_npu_compiler_loader.so";
+    const COMPILER: &str = "libopenvino_intel_npu_compiler.so";
+    const OLD_COMPILER: &str = "libnpu_driver_compiler.so";
+
+    #[test]
+    fn the_host_driver_is_found_through_its_ldconfig_line() {
+        let scratch = Scratch::new("host");
+        let driver = scratch.driver("lib64", "1.32.0", NAMES_1_32);
+        let without_compiler = scratch.machine(&ldconfig_with(&[(NPU_DRIVER, &driver)]), None);
+        assert_eq!(without_compiler.npu_driver.as_deref(), Some("1.32.0"));
+        assert_eq!(without_compiler.npu_compiler_needs, [[OLD_COMPILER]]);
+        assert!(!without_compiler.npu_compiler);
+        assert_eq!(without_compiler.npu_prefix, None);
+
+        let lib = Path::new("/lib64/libnpu_driver_compiler.so");
+        let with_compiler = scratch.machine(
+            &ldconfig_with(&[(NPU_DRIVER, &driver), (OLD_COMPILER, lib)]),
+            None,
+        );
+        assert!(with_compiler.npu_compiler);
+    }
+
+    #[test]
+    fn a_machine_with_no_driver_has_no_version_and_no_compiler() {
+        let scratch = Scratch::new("none");
+        let dangling = scratch.0.join("gone").join(NPU_DRIVER);
+        for ldconfig in [String::new(), ldconfig_with(&[(NPU_DRIVER, &dangling)])] {
+            let machine = scratch.machine(&ldconfig, None);
+            assert_eq!(machine.npu_driver, None);
+            assert!(machine.npu_compiler_needs.is_empty());
+            assert!(!machine.npu_compiler);
+        }
+    }
+
+    #[test]
+    fn a_prefix_compiler_completes_a_host_driver_that_loads_it_by_soname() {
+        let scratch = Scratch::new("prefix-compiler");
+        let driver = scratch.driver("lib64", "1.32.0", NAMES_1_32);
+        let prefix = scratch.prefix(&[NPU_PRELOAD, OLD_COMPILER]);
+        let machine = scratch.machine(&ldconfig_with(&[(NPU_DRIVER, &driver)]), Some(&prefix));
+        assert!(machine.npu_compiler);
+        assert_eq!(machine.npu_driver.as_deref(), Some("1.32.0"));
+        assert_eq!(machine.npu_prefix, Some(prefix.display().to_string()));
+    }
+
+    #[test]
+    fn a_prefix_without_a_preload_list_is_not_counted() {
+        let scratch = Scratch::new("no-preload");
+        let driver = scratch.driver("lib64", "1.32.0", NAMES_1_32);
+        let prefix = scratch.prefix(&[OLD_COMPILER]);
+        let machine = scratch.machine(&ldconfig_with(&[(NPU_DRIVER, &driver)]), Some(&prefix));
+        assert!(!machine.npu_compiler);
+        assert_eq!(machine.npu_prefix, None);
+    }
+
+    #[test]
+    fn the_loader_in_a_prefix_only_counts_beside_the_prefixes_own_driver() {
+        let scratch = Scratch::new("beside");
+        let host = scratch.driver("lib64", "1.35.0", NAMES_1_35);
+        let ldconfig = ldconfig_with(&[(NPU_DRIVER, &host)]);
+        let prefix = scratch.prefix(&[NPU_PRELOAD, LOADER, COMPILER]);
+        let host_driver_only = scratch.machine(&ldconfig, Some(&prefix));
+        assert_eq!(host_driver_only.npu_driver.as_deref(), Some("1.35.0"));
+        assert!(!host_driver_only.npu_compiler);
+
+        scratch.driver("prefix", "1.38.0", NAMES_1_35);
+        let with_prefix_driver = scratch.machine(&ldconfig, Some(&prefix));
+        assert_eq!(with_prefix_driver.npu_driver.as_deref(), Some("1.38.0"));
+        assert!(with_prefix_driver.npu_compiler);
     }
 
     #[test]
