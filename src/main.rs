@@ -136,6 +136,49 @@ fn want(build: bool, openvino_only: bool) -> Want {
     }
 }
 
+/// `resolve` without `--json`: the plan as aligned `label: value` lines.
+fn print_plan(plan: &resolve::Plan) {
+    println!(
+        "floor:    {} ({})",
+        plan.floor.openvino.as_deref().unwrap_or("none"),
+        plan.floor.reason
+    );
+    if let Some(ceiling) = &plan.driver_ceiling {
+        println!("ceiling:  {ceiling} (newest known to compile on the installed NPU driver)");
+    }
+    match &plan.artifact.onnxruntime {
+        Some(ort) => println!(
+            "openvino: {} (onnxruntime-openvino {ort}, {:?})",
+            plan.openvino, plan.artifact.trust
+        ),
+        None => println!(
+            "openvino: {} (alone, {:?})",
+            plan.openvino, plan.artifact.trust
+        ),
+    }
+    match &plan.artifact.build {
+        Some(recipe) => {
+            println!(
+                "build:    {} {} @ {}",
+                recipe.git_repo, recipe.git_tag, recipe.git_commit
+            );
+            println!(
+                "against:  {} ({:?})",
+                recipe.openvino_wheel.url, recipe.openvino_wheel.trust
+            );
+            println!("          sha256 {}", recipe.openvino_wheel.sha256);
+            println!("recipe:   {}", plan.artifact.sha256);
+        }
+        None => {
+            println!("download: {}", plan.artifact.url);
+            println!("sha256:   {}", plan.artifact.sha256);
+        }
+    }
+    for warning in &plan.warnings {
+        println!("warning:  {warning}");
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let data = data::Data::load(cli.data_dir.as_deref())?;
@@ -164,42 +207,7 @@ fn main() -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&plan)?);
             } else {
-                println!(
-                    "floor:    {} ({})",
-                    plan.floor.openvino.as_deref().unwrap_or("none"),
-                    plan.floor.reason
-                );
-                if let Some(c) = &plan.driver_ceiling {
-                    println!("ceiling:  {c} (newest known to compile on the installed NPU driver)");
-                }
-                match &plan.artifact.onnxruntime {
-                    Some(ort) => println!(
-                        "openvino: {} (onnxruntime-openvino {ort}, {:?})",
-                        plan.openvino, plan.artifact.trust
-                    ),
-                    None => println!(
-                        "openvino: {} (alone, {:?})",
-                        plan.openvino, plan.artifact.trust
-                    ),
-                }
-                match &plan.artifact.build {
-                    Some(b) => {
-                        println!("build:    {} {} @ {}", b.git_repo, b.git_tag, b.git_commit);
-                        println!(
-                            "against:  {} ({:?})",
-                            b.openvino_wheel.url, b.openvino_wheel.trust
-                        );
-                        println!("          sha256 {}", b.openvino_wheel.sha256);
-                        println!("recipe:   {}", plan.artifact.sha256);
-                    }
-                    None => {
-                        println!("download: {}", plan.artifact.url);
-                        println!("sha256:   {}", plan.artifact.sha256);
-                    }
-                }
-                for w in &plan.warnings {
-                    println!("warning:  {w}");
-                }
+                print_plan(&plan);
             }
         }
         Cmd::Install {
@@ -233,24 +241,7 @@ fn main() -> Result<()> {
             for w in &plan.warnings {
                 eprintln!("warning: {w}");
             }
-            install::install(&plan, &prefix, &opts, |id| {
-                let Some((project, filename)) =
-                    id.strip_prefix("pypi/").and_then(|r| r.split_once('/'))
-                else {
-                    return Vec::new();
-                };
-                let file = sources::PypiFile {
-                    project: project.into(),
-                    version: String::new(),
-                    filename: filename.into(),
-                    url: String::new(),
-                    size: 0,
-                    sha256: String::new(),
-                    uploaded: String::new(),
-                };
-                let urls = sources::pypi_download_urls(&file, &sources::mirror_pages(project));
-                urls.into_iter().filter(|u| !u.is_empty()).collect()
-            })?;
+            install::install(&plan, &prefix, &opts, sources::mirror_download_urls)?;
         }
         Cmd::Verify { prefix } => {
             install::verify(&prefix)?;

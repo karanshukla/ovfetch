@@ -24,10 +24,36 @@ pub struct PypiFile {
     pub uploaded: String,
 }
 
+const PYPI_ID_PREFIX: &str = "pypi/";
+
 impl PypiFile {
     pub fn ledger_id(&self) -> String {
-        format!("pypi/{}/{}", self.project, self.filename)
+        format!("{PYPI_ID_PREFIX}{}/{}", self.project, self.filename)
     }
+}
+
+/// The `(project, filename)` a `pypi/<project>/<filename>` ledger id names.
+pub fn pypi_id_parts(ledger_id: &str) -> Option<(&str, &str)> {
+    ledger_id.strip_prefix(PYPI_ID_PREFIX)?.split_once('/')
+}
+
+/// Every place the PyPI file behind `ledger_id` can be downloaded from, from
+/// the mirrors that list it. Empty for an id that is not a PyPI file.
+pub fn mirror_download_urls(ledger_id: &str) -> Vec<String> {
+    let Some((project, filename)) = pypi_id_parts(ledger_id) else {
+        return Vec::new();
+    };
+    let file = PypiFile {
+        project: project.into(),
+        version: String::new(),
+        filename: filename.into(),
+        url: String::new(),
+        size: 0,
+        sha256: String::new(),
+        uploaded: String::new(),
+    };
+    let urls = pypi_download_urls(&file, &mirror_pages(project));
+    urls.into_iter().filter(|u| !u.is_empty()).collect()
 }
 
 /// Every non-yanked Linux x86_64 wheel for `project`, newest release first.
@@ -330,6 +356,21 @@ pub fn pypi_provenance(project: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pypi_ledger_id_splits_back_into_project_and_file() {
+        let file = wheel("openvino-2026.4.1-cp313-abi3-manylinux_2_28_x86_64.whl");
+        assert_eq!(
+            pypi_id_parts(&file.ledger_id()),
+            Some((file.project.as_str(), file.filename.as_str()))
+        );
+        assert_eq!(
+            pypi_id_parts("github/intel/linux-npu-driver/v1.35.0/x.tar.gz"),
+            None
+        );
+        assert_eq!(pypi_id_parts("pypi/no-file"), None);
+        assert!(mirror_download_urls("github/intel/linux-npu-driver/v1.35.0/x.tar.gz").is_empty());
+    }
 
     #[test]
     fn resolves_relative_mirror_hrefs() {

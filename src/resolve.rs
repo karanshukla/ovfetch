@@ -126,10 +126,7 @@ pub fn recipe_digest(build: &Build, openvino_sha256: &str) -> String {
 }
 
 fn build_artifact(build: &Build, data: &Data) -> Result<Artifact> {
-    let (project, filename) = build
-        .openvino_wheel
-        .strip_prefix("pypi/")
-        .and_then(|r| r.split_once('/'))
+    let (project, filename) = sources::pypi_id_parts(&build.openvino_wheel)
         .with_context(|| format!("recipe input {} is not a PyPI file", build.openvino_wheel))?;
     let wheel = sources::pypi_wheels(project)?
         .into_iter()

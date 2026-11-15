@@ -10,8 +10,8 @@ use crate::version::Ver;
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 
-/// The lowest release worth tracking; older wheels predate OpenVINO being bundled.
-/// PyPI projects whose wheels `discover` records, and the oldest version kept.
+/// PyPI projects whose wheels `discover` records, and the oldest version kept:
+/// older onnxruntime-openvino wheels predate OpenVINO being bundled.
 /// `openvino` alone serves `install --openvino-only` and every recipe's input.
 const TRACKED: &[(&str, &str)] = &[("onnxruntime-openvino", "1.22"), ("openvino", "2025.4")];
 pub(crate) const NPU_DRIVER_REPO: &str = "intel/linux-npu-driver";
