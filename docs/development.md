@@ -19,7 +19,8 @@ It also builds the static musl release binary and smoke-tests it, holds line
 coverage above a floor (`cargo llvm-cov`), lints the workflows with
 `actionlint`, and runs `.github/tests/guard.sh` against a stub `gh`.
 
-Tests need no NPU, no network and no root. The data files are compiled in, so
+Tests need no NPU, no network and no root. `resolve`, `npu::plan` and `ci audit` run whole against
+`upstream::fake::Fake`. The data files are compiled in, so
 `cargo test` also proves each one parses, and `tests/data_invariants.rs` checks
 their shape without naming a release, so a Discover PR never has to edit a
 test.
@@ -36,6 +37,7 @@ Without the default `cli` feature only the offline half is built.
 | `version.rs` | `Ver`, a dotted numeric version | always |
 | `net.rs` | HTTPS to the host allowlist, redirects checked hop by hop, streaming sha256 | `cli` |
 | `sources.rs` | PyPI, its mirrors and GitHub: what each claims about a file | `cli` |
+| `upstream.rs` | The `Upstream` trait: every network question, with `Network` as the live answer and a `Fake` for tests | `cli` |
 | `consensus.rs` | Whether the sources' claims and the ledger agree on a hash | `cli` |
 | `resolve.rs` | The plan: which artifact fits the floor and ceiling | `cli` |
 | `install.rs` | Download, unzip and install a plan | `cli` |
@@ -43,7 +45,7 @@ Without the default `cli` feature only the offline half is built.
 | `npu.rs` | `npu install`: the compiler and driver from Intel's release | `cli` |
 | `prefix.rs` | An installed prefix: `SHA256SUMS`, the lock, `verify`, the atomic swap | `cli` |
 | `libs.rs` | Staged libraries: symlink names, the `$ORIGIN`-only search path check | `cli` |
-| `elf.rs` | Soname, RPATH and RUNPATH out of an ELF64 file | `cli` |
+| `elf.rs` | Soname, RPATH and RUNPATH out of an ELF64 file, as the loader sees it (layouts from `object`) | `cli` |
 | `listing.rs`, `tempdir.rs` | Directory listings; a private scratch directory | `cli` |
 | `ci.rs` | `ci audit` and `ci discover`, run by the scheduled workflows | `cli` |
 

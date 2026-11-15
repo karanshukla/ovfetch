@@ -3,9 +3,9 @@
 
 use crate::consensus;
 use crate::data::{Data, Entry, NpuDriver, Platform};
-use crate::net;
-use crate::sources::{self, PypiFile};
+use crate::sources::{self, GithubRelease, MirrorPages, PypiFile};
 use crate::tempdir;
+use crate::upstream::{Network, Upstream};
 use crate::version::Ver;
 use anyhow::{Context, Result, bail};
 use jiff::civil::Date;
@@ -47,110 +47,192 @@ fn nth_wrapping<T>(items: &[T], n: usize) -> Option<&T> {
     items.get(n.checked_rem(items.len())?)
 }
 
+/// What `audit` has already asked upstream, so each project and repo is
+/// fetched once however many ledger entries name it.
+#[derive(Default)]
+struct Fetched {
+    wheels: HashMap<String, Vec<PypiFile>>,
+    pages: HashMap<String, MirrorPages>,
+    releases: HashMap<String, Vec<GithubRelease>>,
+}
+
 /// Returns the markdown report; fails if any recorded hash changed.
 pub fn audit(data: &Data, sample: usize) -> Result<String> {
-    let mut problems = Vec::new();
-    let mut checked = 0;
-    let mut pages: HashMap<String, sources::MirrorPages> = HashMap::new();
-    let mut wheels: HashMap<String, Vec<PypiFile>> = HashMap::new();
-    let mut releases: HashMap<String, Vec<sources::GithubRelease>> = HashMap::new();
-    let mut spot: Vec<(PypiFile, String)> = Vec::new();
+    let clock_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .subsec_nanos() as usize;
+    audit_with(&Network, data, sample, clock_nanos)
+}
 
-    for e in &data.ledger.list {
-        let parts: Vec<&str> = e.id.split('/').collect();
-        let result: Result<()> = (|| match parts.as_slice() {
+/// [`audit`] against any [`Upstream`]. `seed` picks which recorded wheels are
+/// downloaded and from which source.
+pub fn audit_with(
+    upstream: &dyn Upstream,
+    data: &Data,
+    sample: usize,
+    seed: usize,
+) -> Result<String> {
+    let mut problems = Vec::new();
+    let mut fetched = Fetched::default();
+    let mut downloadable: Vec<(PypiFile, String)> = Vec::new();
+
+    for entry in &data.ledger.list {
+        let parts: Vec<&str> = entry.id.split('/').collect();
+        let result = match parts.as_slice() {
             ["pypi", project, filename] => {
-                let list = match wheels.get(*project) {
-                    Some(l) => l,
-                    None => wheels
-                        .entry(project.to_string())
-                        .or_insert(sources::pypi_wheels(project)?),
-                };
-                let file = list
-                    .iter()
-                    .find(|w| w.filename == *filename)
-                    .context("no longer on PyPI (deleted or yanked)")?;
-                let pages = pages
-                    .entry(project.to_string())
-                    .or_insert_with(|| sources::mirror_pages(project));
-                consensus::agree(&e.id, &sources::pypi_claims(file, pages), &data.ledger)?;
-                spot.push((file.clone(), e.digest.clone()));
-                Ok(())
+                audit_pypi_file(upstream, data, &mut fetched, entry, project, filename)
+                    .map(|file| downloadable.push((file, entry.digest.clone())))
             }
-            ["github", owner, repo, tag, asset] => {
-                let key = format!("{owner}/{repo}");
-                let list = match releases.get(&key) {
-                    Some(l) => l,
-                    None => releases
-                        .entry(key.clone())
-                        .or_insert(sources::github_releases(&key)?),
-                };
-                let got = list
-                    .iter()
-                    .find(|r| r.tag == *tag)
-                    .and_then(|r| r.assets.iter().find(|a| a.name == *asset))
-                    .context("release asset no longer published")?;
-                if got.sha256 != e.digest {
-                    bail!("GitHub now reports {} (recorded {})", got.sha256, e.digest);
-                }
-                Ok(())
-            }
-            _ => bail!("unrecognised ledger id"),
-        })();
-        checked += 1;
+            ["github", owner, repo, tag, asset] => audit_github_asset(
+                upstream,
+                &mut fetched,
+                entry,
+                &format!("{owner}/{repo}"),
+                tag,
+                asset,
+            ),
+            _ => Err(anyhow::anyhow!("unrecognised ledger id")),
+        };
         if let Err(err) = result {
-            problems.push(format!("- `{}`: {err:#}", e.id));
+            problems.push(format!("- `{}`: {err:#}", entry.id));
         }
     }
+    audit_recipes(upstream, data, &mut problems);
+    let sampled = sample.min(downloadable.len());
+    spot_download(
+        upstream,
+        &fetched.pages,
+        &downloadable,
+        sampled,
+        seed,
+        &mut problems,
+    )?;
 
-    for b in &data.builds.list {
-        let id = format!("build {} {}", b.git_repo, b.git_tag);
-        checked += 1;
-        if data.ledger.get(&b.openvino_wheel).is_none() {
+    let checked = data.ledger.list.len() + data.builds.list.len();
+    audit_report(checked, sampled, &problems)
+}
+
+/// Checks that PyPI and its mirrors still agree with the ledger on one wheel.
+fn audit_pypi_file(
+    upstream: &dyn Upstream,
+    data: &Data,
+    fetched: &mut Fetched,
+    entry: &Entry,
+    project: &str,
+    filename: &str,
+) -> Result<PypiFile> {
+    let wheels = match fetched.wheels.get(project) {
+        Some(wheels) => wheels,
+        None => fetched
+            .wheels
+            .entry(project.to_owned())
+            .or_insert(upstream.pypi_wheels(project)?),
+    };
+    let file = wheels
+        .iter()
+        .find(|w| w.filename == filename)
+        .context("no longer on PyPI (deleted or yanked)")?;
+    let pages = fetched
+        .pages
+        .entry(project.to_owned())
+        .or_insert_with(|| upstream.mirror_pages(project));
+    consensus::agree(&entry.id, &sources::pypi_claims(file, pages), &data.ledger)?;
+    Ok(file.clone())
+}
+
+/// Checks that GitHub still reports the recorded digest for a release asset.
+fn audit_github_asset(
+    upstream: &dyn Upstream,
+    fetched: &mut Fetched,
+    entry: &Entry,
+    repo: &str,
+    tag: &str,
+    asset: &str,
+) -> Result<()> {
+    let releases = match fetched.releases.get(repo) {
+        Some(releases) => releases,
+        None => fetched
+            .releases
+            .entry(repo.to_owned())
+            .or_insert(upstream.github_releases(repo)?),
+    };
+    let published = releases
+        .iter()
+        .find(|r| r.tag == tag)
+        .and_then(|r| r.assets.iter().find(|a| a.name == asset))
+        .context("release asset no longer published")?;
+    if published.sha256 != entry.digest {
+        bail!(
+            "GitHub now reports {} (recorded {})",
+            published.sha256,
+            entry.digest
+        );
+    }
+    Ok(())
+}
+
+/// Every recipe's OpenVINO input must be in the ledger, and its tag must
+/// still point at the pinned commit.
+fn audit_recipes(upstream: &dyn Upstream, data: &Data, problems: &mut Vec<String>) {
+    for recipe in &data.builds.list {
+        let id = format!("build {} {}", recipe.git_repo, recipe.git_tag);
+        if data.ledger.get(&recipe.openvino_wheel).is_none() {
             problems.push(format!(
                 "- `{id}`: input {} is not in the ledger",
-                b.openvino_wheel
+                recipe.openvino_wheel
             ));
         }
-        match sources::github_tag_commit(&b.git_repo, &b.git_tag) {
-            Ok(c) if c == b.git_commit => {}
-            Ok(c) => problems.push(format!(
-                "- `{id}`: tag now points at {c}, recipe pins {}",
-                b.git_commit
+        match upstream.github_tag_commit(&recipe.git_repo, &recipe.git_tag) {
+            Ok(commit) if commit == recipe.git_commit => {}
+            Ok(commit) => problems.push(format!(
+                "- `{id}`: tag now points at {commit}, recipe pins {}",
+                recipe.git_commit
             )),
             Err(e) => problems.push(format!("- `{id}`: {e:#}")),
         }
     }
+}
 
-    // Index pages can agree while a mirror serves different bytes, so download
-    // a random few from a random mirror and hash what actually arrives.
-    let start = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .subsec_nanos() as usize;
+/// A stride coprime to any plausible ledger size, so successive picks spread out.
+const SAMPLE_STRIDE: usize = 7919;
+
+/// Index pages can agree while a mirror serves different bytes, so this
+/// downloads `count` recorded wheels, each from one of its sources, and
+/// hashes what arrives.
+fn spot_download(
+    upstream: &dyn Upstream,
+    pages: &HashMap<String, MirrorPages>,
+    downloadable: &[(PypiFile, String)],
+    count: usize,
+    seed: usize,
+    problems: &mut Vec<String>,
+) -> Result<()> {
     let dir = tempdir::private()?;
-    let tmp = dir.path().join("spot");
-    for i in 0..sample.min(spot.len()) {
-        let (file, want) = &spot[(start + i * 7919) % spot.len()];
+    let dest = dir.path().join("spot");
+    for i in 0..count {
+        let (file, recorded) = &downloadable[(seed + i * SAMPLE_STRIDE) % downloadable.len()];
         let page = pages.get(&file.project).cloned().unwrap_or_default();
         let urls = sources::pypi_download_urls(file, &page);
-        let Some(url) = nth_wrapping(&urls, start / 3 + i) else {
+        let Some(url) = nth_wrapping(&urls, seed / 3 + i) else {
             eprintln!(
                 "note: no source lists a download URL for {}",
                 file.ledger_id()
             );
             continue;
         };
-        match net::download(url, &tmp) {
-            Ok(got) if got == *want => {}
-            Ok(got) => problems.push(format!("- `{url}` served sha256 {got}, recorded {want}")),
+        match upstream.download(url, &dest) {
+            Ok(got) if got == *recorded => {}
+            Ok(got) => problems.push(format!(
+                "- `{url}` served sha256 {got}, recorded {recorded}"
+            )),
             Err(err) => eprintln!("note: spot download of {url} failed: {err:#}"),
         }
     }
+    Ok(())
+}
 
-    let mut report = format!(
-        "Audited {checked} recorded artifacts, spot-downloaded {}.\n",
-        sample.min(spot.len())
-    );
+fn audit_report(checked: usize, sampled: usize, problems: &[String]) -> Result<String> {
+    let mut report = format!("Audited {checked} recorded artifacts, spot-downloaded {sampled}.\n");
     if problems.is_empty() {
         report.push_str("\nEvery source still agrees with the ledger.\n");
         return Ok(report);
@@ -464,6 +546,171 @@ mod tests {
         assert_eq!(before(2028, 3, 3, 7), "2028-02-25");
         assert_eq!(before(2028, 3, 1, 1), "2028-02-29");
         assert_eq!(before(2027, 3, 1, 1), "2027-02-28");
+    }
+
+    use crate::data::{Build, Builds, Ledger, NpuDrivers, Platforms};
+    use crate::sources::GithubAsset;
+    use crate::upstream::fake::{Fake, wheel};
+
+    const DRIVER_ASSET: &str = "github/intel/linux-npu-driver/v1.35.0/driver.tar.gz";
+
+    fn ledger_entry(id: &str, digest: &str) -> Entry {
+        Entry {
+            id: id.into(),
+            digest: digest.into(),
+            first_seen: "2026-01-08".into(),
+            provenance: false,
+        }
+    }
+
+    /// One recorded wheel and one recorded release asset, with an upstream
+    /// that still agrees with both.
+    fn recorded() -> (Fake, Data) {
+        let ov = wheel("openvino", "2026.4.1", "cp313", "0a");
+        let mut fake = Fake::with_wheels(vec![ov.clone()]);
+        fake.releases.insert(
+            NPU_DRIVER_REPO.into(),
+            vec![GithubRelease {
+                tag: "v1.35.0".into(),
+                url: String::new(),
+                body: String::new(),
+                assets: vec![GithubAsset {
+                    name: "driver.tar.gz".into(),
+                    sha256: "d1".repeat(32),
+                }],
+            }],
+        );
+        fake.downloads.insert(ov.url.clone(), ov.sha256.clone());
+        let data = Data {
+            dir: None,
+            platforms: Platforms::default(),
+            npu_drivers: NpuDrivers::default(),
+            ledger: Ledger {
+                list: vec![
+                    ledger_entry(&ov.ledger_id(), &ov.sha256),
+                    ledger_entry(DRIVER_ASSET, &"d1".repeat(32)),
+                ],
+            },
+            builds: Builds::default(),
+        };
+        (fake, data)
+    }
+
+    #[test]
+    fn an_audit_passes_while_every_source_agrees_with_the_ledger() {
+        let (fake, data) = recorded();
+        let report = audit_with(&fake, &data, 1, 0).unwrap();
+        assert_eq!(
+            report,
+            "Audited 2 recorded artifacts, spot-downloaded 1.\n\nEvery source still agrees with the ledger.\n"
+        );
+        assert_eq!(fake.downloaded.borrow().len(), 1);
+    }
+
+    #[test]
+    fn an_audit_samples_no_more_wheels_than_asked_or_recorded() {
+        let (fake, data) = recorded();
+        audit_with(&fake, &data, 0, 0).unwrap();
+        assert!(fake.downloaded.borrow().is_empty());
+        let report = audit_with(&fake, &data, 5, 3).unwrap();
+        assert!(report.contains("spot-downloaded 1."), "{report}");
+    }
+
+    fn audit_failure(fake: &Fake, data: &Data) -> String {
+        audit_with(fake, data, 1, 0).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn an_audit_fails_when_a_mirror_or_github_reports_another_hash() {
+        let (mut fake, data) = recorded();
+        let filename = fake.wheels[0].filename.clone();
+        fake.mirror_disagrees.insert(filename, "ee".repeat(32));
+        fake.releases.get_mut(NPU_DRIVER_REPO).unwrap()[0].assets[0].sha256 = "d2".repeat(32);
+        let report = audit_failure(&fake, &data);
+        assert!(
+            report.contains("**2 artifact(s) no longer match"),
+            "{report}"
+        );
+        assert!(report.contains("SOURCES DISAGREE"), "{report}");
+        assert!(
+            report.contains(&format!("GitHub now reports {}", "d2".repeat(32))),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn an_audit_fails_when_a_recorded_artifact_is_gone_or_unrecognised() {
+        let (mut fake, mut data) = recorded();
+        fake.wheels.clear();
+        fake.releases.get_mut(NPU_DRIVER_REPO).unwrap()[0]
+            .assets
+            .clear();
+        data.ledger.list.push(ledger_entry("ftp/somewhere/x", "00"));
+        let report = audit_failure(&fake, &data);
+        assert!(
+            report.contains("no longer on PyPI (deleted or yanked)"),
+            "{report}"
+        );
+        assert!(
+            report.contains("release asset no longer published"),
+            "{report}"
+        );
+        assert!(
+            report.contains("`ftp/somewhere/x`: unrecognised ledger id"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn an_audit_fails_when_a_download_serves_other_bytes() {
+        let (mut fake, data) = recorded();
+        let url = fake.wheels[0].url.clone();
+        fake.downloads.insert(url.clone(), "bad".into());
+        let report = audit_failure(&fake, &data);
+        assert!(
+            report.contains(&format!(
+                "`{url}` served sha256 bad, recorded {}",
+                "0a".repeat(32)
+            )),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn an_audit_checks_each_recipes_input_and_tag() {
+        let (mut fake, mut data) = recorded();
+        let pinned = Build {
+            onnxruntime: "1.24.1".into(),
+            openvino: "2026.4.1".into(),
+            git_repo: "microsoft/onnxruntime".into(),
+            git_tag: "v1.24.1".into(),
+            git_commit: "c0ffee".into(),
+            openvino_wheel: data.ledger.list[0].id.clone(),
+            build_args: vec![],
+            cmake_defines: vec![],
+            note: None,
+        };
+        fake.tags
+            .insert("microsoft/onnxruntime v1.24.1".into(), "c0ffee".into());
+        data.builds.list.push(pinned.clone());
+        let report = audit_with(&fake, &data, 0, 0).unwrap();
+        assert!(
+            report.starts_with("Audited 3 recorded artifacts"),
+            "{report}"
+        );
+
+        fake.tags
+            .insert("microsoft/onnxruntime v1.24.1".into(), "deadbeef".into());
+        data.builds.list[0].openvino_wheel = "pypi/openvino/unrecorded.whl".into();
+        let report = audit_failure(&fake, &data);
+        assert!(
+            report.contains("input pypi/openvino/unrecorded.whl is not in the ledger"),
+            "{report}"
+        );
+        assert!(
+            report.contains("tag now points at deadbeef, recipe pins c0ffee"),
+            "{report}"
+        );
     }
 
     #[test]
