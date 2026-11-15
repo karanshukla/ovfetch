@@ -1,21 +1,21 @@
-//! Reading the dynamic section of a little-endian ELF64 file.
+//! Reading the dynamic section of a little-endian ELF64 file, as the loader
+//! sees it. `object` supplies the layouts; which segments are trusted is
+//! decided here.
 
-const MAGIC: &[u8] = b"\x7fELF";
-const CLASS_64: u8 = 2;
-const LITTLE_ENDIAN: u8 = 1;
+use object::LittleEndian;
+use object::elf::{
+    DT_NULL, DT_RPATH, DT_RUNPATH, DT_SONAME, DT_STRTAB, DynamicTag, ELFMAG, FileHeader64,
+    PT_DYNAMIC, PT_LOAD, ProgramHeader64,
+};
+use object::read::elf::{Dyn, FileHeader, ProgramHeader};
 
-const PT_LOAD: usize = 1;
-const PT_DYNAMIC: usize = 2;
-const DYNAMIC_ENTRY_SIZE: usize = 16;
+type Header = FileHeader64<LittleEndian>;
+type Segment = ProgramHeader64<LittleEndian>;
 
-const DT_NULL: usize = 0;
-const DT_STRTAB: usize = 5;
-const DT_SONAME: usize = 14;
-const DT_RPATH: usize = 15;
-const DT_RUNPATH: usize = 29;
+const DYNAMIC_ENTRY_SIZE: u64 = 16;
 
 pub(crate) fn is_elf(bytes: &[u8]) -> bool {
-    bytes.starts_with(MAGIC)
+    bytes.starts_with(&ELFMAG)
 }
 
 /// The soname of a shared object, if it has one.
@@ -34,82 +34,60 @@ pub(crate) fn search_paths(elf: &[u8]) -> Option<Vec<String>> {
     Some(paths)
 }
 
-struct ProgramHeader {
-    kind: usize,
-    file_offset: usize,
-    virtual_address: usize,
-    file_size: usize,
-}
-
-fn little_endian_uint(bytes: &[u8], at: usize, len: usize) -> Option<usize> {
-    let raw = bytes.get(at..at.checked_add(len)?)?;
-    Some(raw.iter().rev().fold(0usize, |a, &x| (a << 8) | x as usize))
-}
-
-fn program_headers(elf: &[u8]) -> Option<Vec<ProgramHeader>> {
-    let field =
-        |at: usize, off: usize, len: usize| little_endian_uint(elf, at.checked_add(off)?, len);
-    if elf.get(..4)? != MAGIC || *elf.get(4)? != CLASS_64 || *elf.get(5)? != LITTLE_ENDIAN {
-        return None;
-    }
-    let (table, entry_size, count) = (field(0, 0x20, 8)?, field(0, 0x36, 2)?, field(0, 0x38, 2)?);
-    (0..count)
-        .map(|i| {
-            let at = table.checked_add(i.checked_mul(entry_size)?)?;
-            Some(ProgramHeader {
-                kind: field(at, 0, 4)?,
-                file_offset: field(at, 0x08, 8)?,
-                virtual_address: field(at, 0x10, 8)?,
-                file_size: field(at, 0x20, 8)?,
-            })
-        })
-        .collect()
-}
-
 /// Strings for one dynamic tag, read the way the loader reads them: the
 /// `PT_DYNAMIC` segment, with `DT_STRTAB` mapped to a file offset through the
 /// `PT_LOAD` segments. Section headers are not used; they can be stripped, or
 /// disagree with what the loader sees. `None` when the file is not a
 /// little-endian ELF64, or is malformed. A statically linked file has none.
-fn dynamic_strings(elf: &[u8], tag: usize) -> Option<Vec<String>> {
-    let headers = program_headers(elf)?;
-    let Some(dynamic) = headers.iter().find(|h| h.kind == PT_DYNAMIC) else {
+fn dynamic_strings(file: &[u8], tag: DynamicTag) -> Option<Vec<String>> {
+    let endian = LittleEndian;
+    let header = Header::parse(file).ok()?;
+    header.endian().ok()?;
+    let segments = header.program_headers(endian, file).ok()?;
+    let Some(dynamic) = segments.iter().find(|s| s.p_type(endian) == PT_DYNAMIC) else {
         return Some(Vec::new());
     };
-    let file_offset_of = |address: usize| {
-        headers
-            .iter()
-            .find(|h| {
-                h.kind == PT_LOAD
-                    && h.virtual_address <= address
-                    && address - h.virtual_address < h.file_size
-            })
-            .and_then(|h| (address - h.virtual_address).checked_add(h.file_offset))
-    };
-    let entry = |at: usize, off: usize| little_endian_uint(elf, at.checked_add(off)?, 8);
+    if dynamic.p_filesz(endian) % DYNAMIC_ENTRY_SIZE != 0 {
+        return None;
+    }
     let (mut string_table, mut string_offsets) = (None, Vec::new());
-    let end = dynamic.file_offset.checked_add(dynamic.file_size)?;
-    for at in (dynamic.file_offset..end).step_by(DYNAMIC_ENTRY_SIZE) {
-        match entry(at, 0)? {
-            DT_NULL => break,
-            DT_STRTAB => string_table = Some(entry(at, 8)?),
-            t if t == tag => string_offsets.push(entry(at, 8)?),
-            _ => {}
+    for entry in dynamic.dynamic(endian, file).ok()?? {
+        let entry_tag = entry.d_tag(endian);
+        if entry_tag == DT_NULL {
+            break;
+        } else if entry_tag == DT_STRTAB {
+            string_table = Some(entry.d_val(endian));
+        } else if entry_tag == tag {
+            string_offsets.push(entry.d_val(endian));
         }
     }
     if string_offsets.is_empty() {
         return Some(Vec::new());
     }
-    let base = file_offset_of(string_table?)?;
+    let table = file_offset(segments, string_table?)?;
     string_offsets
         .into_iter()
         .map(|offset| {
-            let name = elf.get(base.checked_add(offset)?..)?;
+            let start = usize::try_from(table.checked_add(offset)?).ok()?;
+            let name = file.get(start..)?;
             let end = name.iter().position(|&c| c == 0)?;
             // Lossy, so one odd byte can't hide the rest of the path.
             Some(String::from_utf8_lossy(&name[..end]).into_owned())
         })
         .collect()
+}
+
+/// Where the loader would find `address` in the file: inside the file-backed
+/// part of a `PT_LOAD` segment.
+fn file_offset(segments: &[Segment], address: u64) -> Option<u64> {
+    let endian = LittleEndian;
+    segments
+        .iter()
+        .find(|s| {
+            let start = s.p_vaddr(endian);
+            s.p_type(endian) == PT_LOAD && start <= address && address - start < s.p_filesz(endian)
+        })
+        .and_then(|s| (address - s.p_vaddr(endian)).checked_add(s.p_offset(endian)))
 }
 
 #[cfg(test)]
@@ -129,47 +107,197 @@ pub(crate) mod tests {
         assert_eq!(soname(b"not elf"), None);
     }
 
-    /// A minimal ELF64 shared object with one DT_RUNPATH and no section
-    /// headers, so only the program headers say where its dynamic strings are.
-    pub(crate) fn elf_with_runpath(runpath: &[u8]) -> Vec<u8> {
-        const BASE: u64 = 0x40_0000;
-        let (ph, dynamic, strtab) = (64u64, 64 + 2 * 56, 64 + 2 * 56 + 3 * 16);
-        let mut strings = vec![0u8];
-        strings.extend_from_slice(runpath);
-        strings.push(0);
+    const BASE: u64 = 0x40_0000;
+    const PROGRAM_HEADERS: u64 = 64;
+    const PROGRAM_HEADER_SIZE: u64 = 56;
+    const LOAD_HEADER: u64 = PROGRAM_HEADERS;
+    const DYNAMIC_HEADER: u64 = PROGRAM_HEADERS + PROGRAM_HEADER_SIZE;
+    const DYNAMIC: u64 = PROGRAM_HEADERS + 2 * PROGRAM_HEADER_SIZE;
+    /// Offsets inside a program header.
+    const P_TYPE: u64 = 0;
+    const P_OFFSET: u64 = 0x08;
+    const P_VADDR: u64 = 0x10;
+    const P_FILESZ: u64 = 0x20;
+    /// Offsets inside the file header.
+    const E_PHOFF: u64 = 0x20;
+
+    const STRTAB: u64 = 5;
+    const SONAME: u64 = 14;
+    const RPATH: u64 = 15;
+    const RUNPATH: u64 = 29;
+    const NULL: u64 = 0;
+
+    fn put(file: &mut [u8], at: u64, value: u64, len: usize) {
+        file[at as usize..at as usize + len].copy_from_slice(&value.to_le_bytes()[..len])
+    }
+
+    /// The address the string table gets in a file with `entries` dynamic entries.
+    fn strtab_address(entries: usize) -> u64 {
+        BASE + DYNAMIC + entries as u64 * 16
+    }
+
+    /// A minimal ELF64 shared object with no section headers, so only the
+    /// program headers say where its dynamic entries and strings are: one
+    /// PT_LOAD over the whole file, one PT_DYNAMIC over `entries`, then
+    /// `strings`.
+    fn elf_with_dynamic(entries: &[(u64, u64)], strings: &[u8]) -> Vec<u8> {
+        let dynamic_size = entries.len() as u64 * 16;
+        let strtab = DYNAMIC + dynamic_size;
         let len = strtab + strings.len() as u64;
         let mut f = vec![0u8; len as usize];
-        let put = |f: &mut Vec<u8>, at: u64, v: u64, n: usize| {
-            f[at as usize..at as usize + n].copy_from_slice(&v.to_le_bytes()[..n])
-        };
         f[..4].copy_from_slice(b"\x7fELF");
         f[4] = 2; // ELFCLASS64
         f[5] = 1; // little-endian
         f[6] = 1;
         put(&mut f, 0x10, 3, 2); // ET_DYN
         put(&mut f, 0x12, 62, 2); // x86-64
-        put(&mut f, 0x20, ph, 8);
-        put(&mut f, 0x36, 56, 2);
+        put(&mut f, E_PHOFF, PROGRAM_HEADERS, 8);
+        put(&mut f, 0x36, PROGRAM_HEADER_SIZE, 2);
         put(&mut f, 0x38, 2, 2);
-        // PT_LOAD over the whole file, PT_DYNAMIC over the three entries.
-        for (i, (ty, off, size)) in [(1u64, 0, len), (2, dynamic, 3 * 16)]
-            .into_iter()
-            .enumerate()
-        {
-            let at = ph + i as u64 * 56;
-            put(&mut f, at, ty, 4);
-            put(&mut f, at + 0x08, off, 8);
-            put(&mut f, at + 0x10, BASE + off, 8);
-            put(&mut f, at + 0x20, size, 8);
+        for (at, kind, offset, size) in [
+            (LOAD_HEADER, 1u64, 0, len),
+            (DYNAMIC_HEADER, 2, DYNAMIC, dynamic_size),
+        ] {
+            put(&mut f, at + P_TYPE, kind, 4);
+            put(&mut f, at + P_OFFSET, offset, 8);
+            put(&mut f, at + P_VADDR, BASE + offset, 8);
+            put(&mut f, at + P_FILESZ, size, 8);
         }
-        for (i, (tag, val)) in [(5u64, BASE + strtab), (29, 1), (0, 0)]
-            .into_iter()
-            .enumerate()
-        {
-            put(&mut f, dynamic + i as u64 * 16, tag, 8);
-            put(&mut f, dynamic + i as u64 * 16 + 8, val, 8);
+        for (i, (tag, value)) in entries.iter().enumerate() {
+            put(&mut f, DYNAMIC + i as u64 * 16, *tag, 8);
+            put(&mut f, DYNAMIC + i as u64 * 16 + 8, *value, 8);
         }
-        f[strtab as usize..].copy_from_slice(&strings);
+        f[strtab as usize..].copy_from_slice(strings);
         f
+    }
+
+    pub(crate) fn elf_with_runpath(runpath: &[u8]) -> Vec<u8> {
+        let strings = [b"\0".as_slice(), runpath, b"\0"].concat();
+        elf_with_dynamic(
+            &[(STRTAB, strtab_address(3)), (RUNPATH, 1), (NULL, 0)],
+            &strings,
+        )
+    }
+
+    fn paths(elf: &[u8]) -> Option<Vec<String>> {
+        search_paths(elf)
+    }
+
+    #[test]
+    fn rpath_and_runpath_are_both_read_and_split() {
+        let elf = elf_with_dynamic(
+            &[
+                (RPATH, 1),
+                (STRTAB, strtab_address(5)),
+                (RUNPATH, 9),
+                (SONAME, 21),
+                (NULL, 0),
+            ],
+            b"\0/opt/a:\0$ORIGIN::/b\0libx.so.1\0",
+        );
+        assert_eq!(
+            paths(&elf),
+            Some(vec!["/opt/a".into(), "$ORIGIN".into(), "/b".into()])
+        );
+        assert_eq!(soname(&elf).as_deref(), Some("libx.so.1"));
+    }
+
+    #[test]
+    fn a_library_with_no_search_path_has_an_empty_one() {
+        let no_tag = elf_with_dynamic(&[(STRTAB, strtab_address(2)), (NULL, 0)], b"\0");
+        assert_eq!(paths(&no_tag), Some(vec![]));
+        assert_eq!(soname(&no_tag), None);
+
+        let mut statically_linked = elf_with_runpath(b"/home/u/build");
+        put(&mut statically_linked, DYNAMIC_HEADER + P_TYPE, 4, 4);
+        assert_eq!(paths(&statically_linked), Some(vec![]));
+    }
+
+    #[test]
+    fn entries_after_the_terminator_are_not_read() {
+        let elf = elf_with_dynamic(
+            &[(STRTAB, strtab_address(3)), (NULL, 0), (RUNPATH, 1)],
+            b"\0/home/u/build\0",
+        );
+        assert_eq!(paths(&elf), Some(vec![]));
+    }
+
+    #[test]
+    fn a_file_that_is_not_little_endian_elf64_is_unreadable() {
+        let good = elf_with_runpath(b"$ORIGIN");
+        assert!(paths(&good).is_some());
+        for (at, value) in [(0usize, b'X'), (4, 1), (5, 2)] {
+            let mut bad = good.clone();
+            bad[at] = value;
+            assert_eq!(paths(&bad), None, "byte {at} = {value}");
+            assert_eq!(soname(&bad), None);
+        }
+        assert_eq!(paths(b""), None);
+        assert_eq!(paths(b"\x7fELF"), None);
+        assert_eq!(paths(b"not elf at all, just text"), None);
+    }
+
+    #[test]
+    fn every_truncation_of_a_library_is_unreadable() {
+        let whole = elf_with_runpath(b"$ORIGIN:/home/u/build/lib");
+        assert!(paths(&whole).is_some());
+        for len in 0..whole.len() {
+            assert_eq!(paths(&whole[..len]), None, "cut at {len}");
+        }
+    }
+
+    #[test]
+    fn a_search_path_that_cannot_be_located_is_unreadable() {
+        let strings = b"\0/home/u/build\0";
+        let no_string_table = elf_with_dynamic(&[(RUNPATH, 1), (NULL, 0)], strings);
+        assert_eq!(paths(&no_string_table), None);
+
+        let unmapped_string_table =
+            elf_with_dynamic(&[(STRTAB, 0x10), (RUNPATH, 1), (NULL, 0)], strings);
+        assert_eq!(paths(&unmapped_string_table), None);
+
+        let string_past_the_end = elf_with_dynamic(
+            &[(STRTAB, strtab_address(3)), (RUNPATH, 10_000), (NULL, 0)],
+            strings,
+        );
+        assert_eq!(paths(&string_past_the_end), None);
+
+        let unterminated_string = elf_with_dynamic(
+            &[(STRTAB, strtab_address(3)), (RUNPATH, 1), (NULL, 0)],
+            b"\0/home/u/build",
+        );
+        assert_eq!(paths(&unterminated_string), None);
+    }
+
+    #[test]
+    fn offsets_that_overflow_or_leave_the_file_are_unreadable() {
+        let good = elf_with_runpath(b"/home/u/build");
+        for (at, value) in [
+            (E_PHOFF, u64::MAX),
+            (E_PHOFF, u64::MAX - 100),
+            (E_PHOFF, good.len() as u64),
+            (DYNAMIC_HEADER + P_OFFSET, u64::MAX - 8),
+            (DYNAMIC_HEADER + P_OFFSET, good.len() as u64),
+            (LOAD_HEADER + P_VADDR, u64::MAX),
+            (LOAD_HEADER + P_FILESZ, 0),
+            (LOAD_HEADER + P_OFFSET, u64::MAX),
+        ] {
+            let mut bad = good.clone();
+            put(&mut bad, at, value, 8);
+            assert_eq!(paths(&bad), None, "{at:#x} = {value:#x}");
+        }
+    }
+
+    #[test]
+    fn a_dynamic_segment_the_file_cannot_hold_is_unreadable() {
+        let good = elf_with_runpath(b"/home/u/build");
+        for size in [3 * 16 + 8, 1 << 40] {
+            let mut bad = good.clone();
+            put(&mut bad, DYNAMIC_HEADER + P_FILESZ, size, 8);
+            assert_eq!(paths(&bad), None, "p_filesz = {size}");
+        }
+        let mut odd_header_size = good.clone();
+        put(&mut odd_header_size, 0x36, 64, 2);
+        assert_eq!(paths(&odd_header_size), None);
     }
 }
