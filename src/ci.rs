@@ -8,6 +8,9 @@ use crate::sources::{self, PypiFile};
 use crate::tempdir;
 use crate::version::Ver;
 use anyhow::{Context, Result, bail};
+use jiff::civil::Date;
+use jiff::tz::TimeZone;
+use jiff::{Timestamp, ToSpan};
 use std::collections::HashMap;
 
 /// PyPI projects whose wheels `discover` records, and the oldest version kept:
@@ -166,18 +169,23 @@ pub fn audit(data: &Data, sample: usize) -> Result<String> {
 const COOLDOWN_DAYS: u32 = 7;
 const INTEL_ORT_REPO: &str = "intel/onnxruntime";
 
+/// Today's UTC date as `YYYY-MM-DD`, the form PyPI's upload dates and the
+/// ledger's `first_seen` use, so dates compare as text.
 fn today() -> String {
     date_ago(0)
 }
 
 fn date_ago(days: u32) -> String {
-    std::process::Command::new("date")
-        .args(["-u", "-d", &format!("{days} days ago"), "+%F"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_owned())
-        .unwrap_or_default()
+    days_before(utc_today(), days).to_string()
+}
+
+fn utc_today() -> Date {
+    Timestamp::now().to_zoned(TimeZone::UTC).date()
+}
+
+/// Saturates at the calendar's first day; no real cooldown reaches it.
+fn days_before(date: Date, days: u32) -> Date {
+    date.saturating_sub(i64::from(days).days())
 }
 
 fn record(data: &mut Data, id: String, digest: String, changes: &mut Vec<String>) {
@@ -424,6 +432,38 @@ mod tests {
     fn picking_from_no_urls_does_not_panic() {
         assert_eq!(nth_wrapping::<String>(&[], 7), None);
         assert_eq!(nth_wrapping(&["a", "b", "c"], 7), Some(&"b"));
+    }
+
+    fn is_iso_date(s: &str) -> bool {
+        let b = s.as_bytes();
+        b.len() == 10
+            && b.iter().enumerate().all(|(i, c)| match i {
+                4 | 7 => *c == b'-',
+                _ => c.is_ascii_digit(),
+            })
+    }
+
+    #[test]
+    fn dates_are_utc_iso_days_that_sort_as_text() {
+        let (today, week_ago, year_ago) = (today(), date_ago(COOLDOWN_DAYS), date_ago(366));
+        for d in [&today, &week_ago, &year_ago] {
+            assert!(is_iso_date(d), "{d:?}");
+        }
+        assert_eq!(date_ago(0), today);
+        assert!(year_ago < week_ago && week_ago < today);
+        assert_ne!(&year_ago[..4], &today[..4]);
+    }
+
+    #[test]
+    fn the_cooldown_counts_back_across_month_year_and_leap_day() {
+        let before = |y, m, d, n| days_before(jiff::civil::date(y, m, d), n).to_string();
+        assert_eq!(before(2026, 11, 15, 0), "2026-11-15");
+        assert_eq!(before(2026, 11, 15, 7), "2026-11-08");
+        assert_eq!(before(2026, 11, 3, 7), "2026-10-27");
+        assert_eq!(before(2027, 1, 2, 7), "2026-12-26");
+        assert_eq!(before(2028, 3, 3, 7), "2028-02-25");
+        assert_eq!(before(2028, 3, 1, 1), "2028-02-29");
+        assert_eq!(before(2027, 3, 1, 1), "2027-02-28");
     }
 
     #[test]
