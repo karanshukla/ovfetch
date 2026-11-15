@@ -16,7 +16,7 @@ include = ["src/**", "data/**", "Cargo.toml", "Cargo.lock", "README.md", "SECURI
 default = ["cli"]
 # The binary and everything that touches the network. Without it the library is
 # offline detection only, for embedding in something like a health check.
-cli = ["dep:ar", "dep:clap", "dep:flate2", "dep:hex", "dep:serde_json", "dep:sha2", "dep:tar", "dep:tempfile", "dep:ureq", "dep:zip"]
+cli = ["dep:ar", "dep:clap", "dep:flate2", "dep:hex", "dep:serde_json", "dep:sha2", "dep:tar", "dep:tempfile", "dep:ureq", "dep:url", "dep:zip"]
 
 [[bin]]
 name = "ovfetch"
@@ -35,6 +35,7 @@ tar = { version = "0.4.46", default-features = false, optional = true }
 tempfile = { version = "3.27.0", optional = true }
 toml = "1.1.6"
 ureq = { version = "3.4.2", default-features = false, features = ["rustls"], optional = true }
+url = { version = "2.5.8", optional = true }
 zip = { version = "9.0.3", default-features = false, features = ["deflate"], optional = true }
 
 [profile.release]
