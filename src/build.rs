@@ -17,6 +17,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const TOOLS: &[&str] = &["git", "cmake", "ninja", "python3", "c++"];
+const OWNER_ONLY: u32 = 0o700;
+const GROUP_OR_OTHER_WRITABLE: u32 = 0o022;
+/// How much of the recipe digest names a build directory.
+const DIGEST_PREFIX_LEN: usize = 12;
 
 /// OpenVINO's runtime, plugins and the ONNX frontend the EP links: the same
 /// set Intel's onnxruntime-openvino wheel ships.
@@ -43,7 +47,8 @@ fn is_onnxruntime(file: &str) -> bool {
         || file == "libonnxruntime_providers_shared.so"
 }
 
-fn first_line(cmd: &str) -> Option<String> {
+/// The first line a tool prints for `--version`, `None` when it is not on PATH.
+fn version_line(cmd: &str) -> Option<String> {
     let out = Command::new(cmd).arg("--version").output().ok()?;
     if !out.status.success() {
         return None;
@@ -79,7 +84,7 @@ fn euid() -> Result<u32> {
 fn ensure_private(dir: &Path) -> Result<()> {
     let meta = fs::symlink_metadata(dir).with_context(|| format!("reading {}", dir.display()))?;
     let me = euid()?;
-    if !meta.is_dir() || meta.uid() != me || meta.mode() & 0o022 != 0 {
+    if !meta.is_dir() || meta.uid() != me || meta.mode() & GROUP_OR_OTHER_WRITABLE != 0 {
         bail!(
             "{} must be a directory owned by uid {me} and writable by no one else \
              (it is uid {}, mode {:o}). Its contents are compiled and installed, so ovfetch will not build there; \
@@ -119,7 +124,7 @@ fn git(src: &Path, args: &[&str]) -> Result<String> {
 
 /// Clones the recipe's tag once, then refuses to build anything but its
 /// pinned commit with a clean tree, submodules included.
-fn source(recipe: &BuildPlan, src: &Path) -> Result<()> {
+fn check_out_pinned_source(recipe: &BuildPlan, src: &Path) -> Result<()> {
     if !src.exists() {
         run(Command::new("git")
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -166,23 +171,23 @@ fn source(recipe: &BuildPlan, src: &Path) -> Result<()> {
 /// Unpacks the OpenVINO wheel's libraries, headers and CMake config. The wheel
 /// is kept to save a download, but re-hashed and re-extracted on every run:
 /// nothing extracted earlier is trusted.
-fn openvino(
+fn unpack_openvino_wheel(
     recipe: &BuildPlan,
     root: &Path,
     fetch: &dyn Fn(&str, &str, &str, &Path) -> Result<()>,
 ) -> Result<PathBuf> {
     let input = &recipe.openvino_wheel;
-    let whl = root.join("openvino.whl");
-    let cached = fs::read(&whl).is_ok_and(|b| net::sha256_hex(&b) == input.sha256);
+    let wheel = root.join("openvino.whl");
+    let cached = fs::read(&wheel).is_ok_and(|b| net::sha256_hex(&b) == input.sha256);
     if !cached {
-        fetch(&input.id, &input.url, &input.sha256, &whl)?;
+        fetch(&input.id, &input.url, &input.sha256, &wheel)?;
     }
-    let dir = root.join("openvino");
-    if dir.exists() {
-        fs::remove_dir_all(&dir)?;
+    let unpacked = root.join("openvino");
+    if unpacked.exists() {
+        fs::remove_dir_all(&unpacked)?;
     }
     install::unzip(
-        &whl,
+        &wheel,
         root,
         |n| {
             ["openvino/libs/", "openvino/include/", "openvino/cmake/"]
@@ -191,7 +196,7 @@ fn openvino(
         },
         false,
     )?;
-    Ok(dir)
+    Ok(unpacked)
 }
 
 /// Builds the recipe under `opts.build_dir` and copies the runtime into `lib`.
@@ -206,7 +211,7 @@ pub fn stage(
     let missing: Vec<&str> = TOOLS
         .iter()
         .copied()
-        .filter(|t| first_line(t).is_none())
+        .filter(|t| version_line(t).is_none())
         .collect();
     if !missing.is_empty() {
         bail!(
@@ -219,58 +224,61 @@ pub fn stage(
         "onnxruntime-{}-openvino-{}-{}",
         plan.artifact.onnxruntime.as_deref().unwrap_or_default(),
         plan.openvino,
-        &plan.artifact.sha256[..12]
+        &plan.artifact.sha256[..DIGEST_PREFIX_LEN]
     ));
     fs::DirBuilder::new()
         .recursive(true)
-        .mode(0o700)
+        .mode(OWNER_ONLY)
         .create(&root)
         .with_context(|| format!("creating {}", root.display()))?;
     ensure_private(&opts.build_dir)?;
     ensure_private(&root)?;
     eprintln!("building in {}", root.display());
 
-    let ov = openvino(recipe, &root, fetch)?;
-    let src = root.join("onnxruntime");
-    source(recipe, &src)?;
+    let openvino_dir = unpack_openvino_wheel(recipe, &root, fetch)?;
+    let source_dir = root.join("onnxruntime");
+    check_out_pinned_source(recipe, &source_dir)?;
 
     // Objects from an earlier run cannot be checked, so every build starts clean.
-    let out = root.join("out");
-    if out.exists() {
-        fs::remove_dir_all(&out)?;
+    let build_output = root.join("out");
+    if build_output.exists() {
+        fs::remove_dir_all(&build_output)?;
     }
-    let mut defines = vec![format!("OpenVINO_DIR={}", ov.join("cmake").display())];
+    let mut defines = vec![format!(
+        "OpenVINO_DIR={}",
+        openvino_dir.join("cmake").display()
+    )];
     defines.extend(recipe.cmake_defines.iter().cloned());
     // -B: bytecode written into the tree would fail the next run's clean check.
     run(Command::new("python3")
         .args(["-B", "-E", "-s"])
-        .arg(src.join("tools/ci_build/build.py"))
+        .arg(source_dir.join("tools/ci_build/build.py"))
         .arg("--build_dir")
-        .arg(&out)
+        .arg(&build_output)
         .args(&recipe.build_args)
         .args(["--parallel", &opts.jobs.to_string()])
         .arg("--cmake_extra_defines")
         .args(&defines)
-        .current_dir(&src)
+        .current_dir(&source_dir)
         // Only the recipe decides which OpenVINO is found.
         .env_remove("INTEL_OPENVINO_DIR")
         .env_remove("OpenVINO_DIR")
         .env_remove("CMAKE_PREFIX_PATH")
         .env_remove("LD_LIBRARY_PATH"))?;
 
-    let release = out.join("Release");
+    let release = build_output.join("Release");
     let mut copied = 0;
     for (dir, keep) in [
         (release.as_path(), is_onnxruntime as fn(&str) -> bool),
-        (&ov.join("libs"), is_openvino_runtime),
+        (&openvino_dir.join("libs"), is_openvino_runtime),
     ] {
-        for e in fs::read_dir(dir)
+        for entry in fs::read_dir(dir)
             .with_context(|| format!("reading {}", dir.display()))?
             .flatten()
         {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if keep(&name) && !e.path().is_symlink() {
-                fs::copy(e.path(), lib.join(&name))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if keep(&name) && !entry.path().is_symlink() {
+                fs::copy(entry.path(), lib.join(&name))?;
                 copied += 1;
             }
         }
@@ -280,8 +288,8 @@ pub fn stage(
     }
 
     Ok(serde_json::json!({
-        "compiler": first_line("c++"),
-        "cmake": first_line("cmake"),
+        "compiler": version_line("c++"),
+        "cmake": version_line("cmake"),
         "build_dir": root,
     }))
 }
