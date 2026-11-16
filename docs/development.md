@@ -60,3 +60,19 @@ vinoAuthFace, vinoOpenEffects, vinoWhisper, vinoSpeak and vinoPilot shell out to
   the order of its lines ([NPU compiler and driver](npu.md));
 - the wording of the bounds: the ceiling is the newest OpenVINO *recorded as
   working*, and anything above it is untested, never "known to fail".
+
+## What the crate swaps cost
+
+Measured 2026-11-16: x86_64 glibc release builds (`cargo build --release --locked`, the repo's own release profile) made in a cloud container with `rustc 1.100.0 (0ef1bc386 2026-11-09)`. Crate count is `cargo tree --locked -e normal --prefix none | sort -u | wc -l`, which includes `ovfetch` itself.
+
+| Commit | Swapped in | `ovfetch` bytes | Change | Crates |
+|---|---|---|---|---|
+| `f166b1f` | (base, before the swaps) | 3,737,296 | | 86 |
+| `77b0343` | `tempfile` | 3,746,768 | +9,472 | 92 |
+| `31c541b` | `ar` | 3,756,976 | +10,208 | 93 |
+| `caea6b9` | `url` | 3,981,872 | +224,896 | 131 |
+| `4d90fae` | `jiff` | 4,224,184 | +242,312 | 133 |
+| `4edbf37` | `object` | 4,222,712 | -1,472 | 134 |
+| `b244daa` | current `main` | 4,225,848 | +3,136 | 134 |
+
+Base to `4edbf37`: +485,416 bytes (+13.0%).
