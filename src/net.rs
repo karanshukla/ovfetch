@@ -76,7 +76,7 @@ fn agent() -> ureq::Agent {
         .timeout_connect(Some(Duration::from_secs(10)))
         .timeout_recv_response(Some(Duration::from_secs(60)))
         .timeout_recv_body(Some(RECV_BODY))
-        .user_agent(concat!("ovfetch/", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("ovfetch/{}", crate::stamp::VERSION))
         .build()
         .into()
 }

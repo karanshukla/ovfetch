@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `ovfetch --version` prints `ovfetch dev` for a build from a git checkout. Release binaries and `cargo install ovfetch` print the real version. The library exposes it as `ovfetch::stamp::VERSION`.
+
 ## [0.6.0] - 2026-10-24
 
 Breaking for library users: `detect::Machine` has a new field, `npu_prefix`.

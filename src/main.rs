@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 /// Resolve, download, and verify the OpenVINO build this machine's Intel NPU needs.
 #[derive(Parser)]
-#[command(version)]
+#[command(version = ovfetch::stamp::VERSION)]
 struct Cli {
     /// Read data/*.toml from this directory instead of the copy compiled in.
     #[arg(long, global = true)]

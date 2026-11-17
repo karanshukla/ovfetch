@@ -30,7 +30,7 @@ fn prints_its_version() {
     assert!(o.status.success());
     assert_eq!(
         String::from_utf8(o.stdout).unwrap().trim(),
-        format!("ovfetch {}", env!("CARGO_PKG_VERSION"))
+        format!("ovfetch {}", ovfetch::stamp::VERSION)
     );
 }
 

@@ -6,6 +6,7 @@
 
 pub mod data;
 pub mod detect;
+pub mod stamp;
 pub mod status;
 pub mod version;
 

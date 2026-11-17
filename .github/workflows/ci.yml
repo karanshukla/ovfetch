@@ -63,8 +63,34 @@ jobs:
         run: |
           bin=target/x86_64-unknown-linux-musl/release/ovfetch
           file "$bin" | tee /dev/stderr | grep -q 'static'
-          "$bin" --version
+          test "$("$bin" --version)" = "ovfetch dev"
           "$bin" detect | jq -e '.devices | type == "array"'
+
+  # A checkout builds as dev, release CI stamps the tag, and the published
+  # crate (no .git in its tarball) is a release without the variable.
+  stamp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Stamped build prints its version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          OVFETCH_VERSION="$version" cargo build --locked
+          test "$(target/debug/ovfetch --version)" = "ovfetch $version"
+      - name: The published crate prints its version without the variable
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          cargo package --locked
+          tar -tzf "target/package/ovfetch-$version.crate" | grep -qx "ovfetch-$version/build.rs"
+          ! tar -tzf "target/package/ovfetch-$version.crate" | grep -q '/\.git/'
+          mkdir "$RUNNER_TEMP/crate"
+          tar -xzf "target/package/ovfetch-$version.crate" -C "$RUNNER_TEMP/crate"
+          cargo build --locked --manifest-path "$RUNNER_TEMP/crate/ovfetch-$version/Cargo.toml" --target-dir "$RUNNER_TEMP/crate-target"
+          test "$("$RUNNER_TEMP/crate-target/debug/ovfetch" --version)" = "ovfetch $version"
 
   coverage:
     runs-on: ubuntu-latest
