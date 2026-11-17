@@ -5,11 +5,18 @@ All notable changes to ovfetch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.0] - 2026-11-17
 
 ### Changed
 
 - `ovfetch --version` prints `ovfetch dev` for a build from a git checkout. Release binaries and `cargo install ovfetch` print the real version. The library exposes it as `ovfetch::stamp::VERSION`.
+
+### Fixed
+
+- `npu install` refuses a package with two entries of the same file name, or a symlink to `.` or `..`, instead of keeping the last one written.
+- Hash claims from a mirror page reject a digest that isn't 64 hex characters, and no longer match a longer file name that ends in the one asked for.
+- The ledger guard fails closed when GitHub's diff can't be read or comes back without a patch, instead of passing the change.
+- `ci audit` no longer panics on a spot file with no download URL.
 
 ## [0.6.0] - 2026-10-24
 
@@ -109,7 +116,8 @@ Breaking for library users: `resolve::resolve`, `Artifact` and `Kind` change (se
 
 - Initial release: resolve, verify and install prebuilt ONNX Runtime and OpenVINO for Intel NPUs.
 
-[Unreleased]: https://github.com/karanshukla/ovfetch/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/karanshukla/ovfetch/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/karanshukla/ovfetch/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/karanshukla/ovfetch/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/karanshukla/ovfetch/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/karanshukla/ovfetch/compare/v0.4.0...v0.4.1
