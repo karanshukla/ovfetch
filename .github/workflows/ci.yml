@@ -86,7 +86,7 @@ jobs:
           version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
           cargo package --locked
           tar -tzf "target/package/ovfetch-$version.crate" | grep -qx "ovfetch-$version/build.rs"
-          ! tar -tzf "target/package/ovfetch-$version.crate" | grep -q '/\.git/'
+          if tar -tzf "target/package/ovfetch-$version.crate" | grep -q '/\.git/'; then exit 1; fi
           mkdir "$RUNNER_TEMP/crate"
           tar -xzf "target/package/ovfetch-$version.crate" -C "$RUNNER_TEMP/crate"
           cargo build --locked --manifest-path "$RUNNER_TEMP/crate/ovfetch-$version/Cargo.toml" --target-dir "$RUNNER_TEMP/crate-target"
