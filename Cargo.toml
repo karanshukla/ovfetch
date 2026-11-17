@@ -10,7 +10,7 @@ readme = "README.md"
 keywords = ["openvino", "onnxruntime", "npu", "intel", "supply-chain"]
 categories = ["command-line-utilities", "hardware-support"]
 # The data files are compiled in, so they ship; CI config and tooling do not.
-include = ["src/**", "data/**", "Cargo.toml", "Cargo.lock", "README.md", "SECURITY.md", "LICENSE-MIT"]
+include = ["build.rs", "src/**", "data/**", "Cargo.toml", "Cargo.lock", "README.md", "SECURITY.md", "LICENSE-MIT"]
 
 [features]
 default = ["cli"]
