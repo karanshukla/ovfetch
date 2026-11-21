@@ -114,6 +114,19 @@ fn link_unversioned_names(lib: &Path) -> Result<()> {
     Ok(())
 }
 
+fn is_allowed_search_path(path: &str) -> bool {
+    if path == ONLY_SEARCH_PATH {
+        return true;
+    }
+    let Some(rest) = path.strip_prefix(&format!("{ONLY_SEARCH_PATH}/")) else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest
+            .split('/')
+            .all(|c| !c.is_empty() && c != "." && c != "..")
+}
+
 /// A library may only search its own directory: an absolute RUNPATH from a
 /// build tree would load whatever sits there later, outside SHA256SUMS.
 /// A library that cannot be read fails closed.
@@ -129,12 +142,9 @@ pub(crate) fn check_search_paths(lib: &Path) -> Result<()> {
             ),
             None => continue,
         };
-        if let Some(outside) = paths
-            .iter()
-            .find(|p| *p != ONLY_SEARCH_PATH && !p.starts_with(&format!("{ONLY_SEARCH_PATH}/")))
-        {
+        if let Some(outside) = paths.iter().find(|p| !is_allowed_search_path(p)) {
             bail!(
-                "{} searches {outside} for libraries; only {ONLY_SEARCH_PATH} is allowed",
+                "{} searches {outside:?} for libraries; only {ONLY_SEARCH_PATH} is allowed",
                 path.display()
             );
         }
@@ -179,12 +189,37 @@ mod tests {
     #[test]
     fn an_origin_runpath_passes() {
         let dir = tempdir::private().unwrap();
+        fs::write(dir.path().join("libok.so"), elf_with_runpath(b"$ORIGIN")).unwrap();
         fs::write(
-            dir.path().join("libok.so"),
-            elf_with_runpath(b"$ORIGIN/../lib"),
+            dir.path().join("libsub.so"),
+            elf_with_runpath(b"$ORIGIN/sub"),
         )
         .unwrap();
         check_search_paths(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn empty_or_parent_traversing_runpaths_are_refused() {
+        for bad in [
+            &b""[..],
+            b":$ORIGIN",
+            b"$ORIGIN:",
+            b"$ORIGIN::",
+            b"$ORIGIN/..",
+            b"$ORIGIN/../lib",
+            b"$ORIGIN/sub/../../lib",
+            b"$ORIGIN/.",
+            b"$ORIGIN/",
+            b"$ORIGIN//sub",
+        ] {
+            let dir = tempdir::private().unwrap();
+            fs::write(dir.path().join("libbad.so"), elf_with_runpath(bad)).unwrap();
+            assert!(
+                check_search_paths(dir.path()).is_err(),
+                "runpath {:?} should be refused",
+                String::from_utf8_lossy(bad)
+            );
+        }
     }
 
     #[test]

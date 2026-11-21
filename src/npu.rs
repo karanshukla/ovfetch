@@ -73,10 +73,18 @@ pub struct Plan {
 /// Which release, and how much of it. The compiler has to come from the same
 /// release as the driver that loads it.
 fn choose(host: &Machine, data: &Data, opts: &Options) -> Result<(String, Mode)> {
+    let want = match &opts.driver {
+        Some(raw) => Some(
+            Ver::parse(raw)
+                .filter(|v| v.0.len() >= 2 && v.to_string() == raw.trim_start_matches('v'))
+                .with_context(|| format!("invalid NPU driver version {raw:?}"))?,
+        ),
+        None => None,
+    };
     match (&host.npu_driver, opts.full) {
         (Some(have), false) => {
-            if let Some(want) = &opts.driver
-                && Ver::parse(want) != Ver::parse(have)
+            if let Some(want) = &want
+                && Some(want) != Ver::parse(have).as_ref()
             {
                 bail!(
                     "the host's NPU driver is {have}, and its compiler must come from the same \
@@ -86,8 +94,8 @@ fn choose(host: &Machine, data: &Data, opts: &Options) -> Result<(String, Mode)>
             Ok((have.clone(), Mode::Compiler))
         }
         _ => {
-            if let Some(want) = &opts.driver {
-                return Ok((want.clone(), Mode::Full));
+            if let Some(want) = want {
+                return Ok((want.to_string(), Mode::Full));
             }
             let codenames: Vec<&str> = host
                 .npus()
@@ -194,8 +202,22 @@ fn ar_member(archive: &[u8], name: &str) -> Result<Vec<u8>> {
         if member.header().identifier() != name.as_bytes() {
             continue;
         }
+        if member.header().size() > install::MAX_ARCHIVE_ENTRY_BYTES {
+            bail!(
+                "ar member {name} exceeds {}-byte size limit",
+                install::MAX_ARCHIVE_ENTRY_BYTES
+            );
+        }
         let mut bytes = Vec::new();
-        member.read_to_end(&mut bytes)?;
+        (&mut member)
+            .take(install::MAX_ARCHIVE_ENTRY_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > install::MAX_ARCHIVE_ENTRY_BYTES {
+            bail!(
+                "ar member {name} exceeds {}-byte size limit",
+                install::MAX_ARCHIVE_ENTRY_BYTES
+            );
+        }
         if bytes.len() as u64 != member.header().size() {
             bail!("truncated ar member {name}");
         }
@@ -210,6 +232,7 @@ fn ar_member(archive: &[u8], name: &str) -> Result<Vec<u8>> {
 fn unpack_libs(data_tar_gz: &[u8], dest: &Path) -> Result<Vec<String>> {
     let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(data_tar_gz));
     let mut names = Vec::new();
+    let mut total_bytes = 0u64;
     for entry in tar.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.to_string_lossy().into_owned();
@@ -222,7 +245,26 @@ fn unpack_libs(data_tar_gz: &[u8], dest: &Path) -> Result<Vec<String>> {
         let out = dest.join(file);
         match entry.header().entry_type() {
             tar::EntryType::Regular => {
-                std::io::copy(&mut entry, &mut fs::File::create(&out)?)?;
+                let mut dst = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&out)?;
+                let remaining = install::MAX_ARCHIVE_TOTAL_BYTES.saturating_sub(total_bytes);
+                let limit = install::MAX_ARCHIVE_ENTRY_BYTES.min(remaining);
+                let written = std::io::copy(&mut (&mut entry).take(limit + 1), &mut dst)?;
+                if written > install::MAX_ARCHIVE_ENTRY_BYTES {
+                    bail!(
+                        "{file} exceeds {}-byte size limit",
+                        install::MAX_ARCHIVE_ENTRY_BYTES
+                    );
+                }
+                total_bytes = total_bytes.saturating_add(written);
+                if total_bytes > install::MAX_ARCHIVE_TOTAL_BYTES {
+                    bail!(
+                        "package exceeds {}-byte decompression limit",
+                        install::MAX_ARCHIVE_TOTAL_BYTES
+                    );
+                }
             }
             tar::EntryType::Symlink => {
                 let target = entry
@@ -247,6 +289,7 @@ fn unpack_libs(data_tar_gz: &[u8], dest: &Path) -> Result<Vec<String>> {
 fn unpack(tarball: &Path, packages: &[&str], dest: &Path) -> Result<()> {
     let mut outer = tar::Archive::new(flate2::read::GzDecoder::new(fs::File::open(tarball)?));
     let mut found = Vec::new();
+    let mut total_bytes = 0u64;
     for entry in outer.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.to_string_lossy().into_owned();
@@ -257,8 +300,24 @@ fn unpack(tarball: &Path, packages: &[&str], dest: &Path) -> Result<()> {
         else {
             continue;
         };
+        let remaining = install::MAX_ARCHIVE_TOTAL_BYTES.saturating_sub(total_bytes);
+        let limit = install::MAX_ARCHIVE_ENTRY_BYTES.min(remaining);
         let mut deb = Vec::new();
-        entry.read_to_end(&mut deb)?;
+        (&mut entry).take(limit + 1).read_to_end(&mut deb)?;
+        let written = deb.len() as u64;
+        if written > install::MAX_ARCHIVE_ENTRY_BYTES {
+            bail!(
+                "{name} exceeds {}-byte size limit",
+                install::MAX_ARCHIVE_ENTRY_BYTES
+            );
+        }
+        total_bytes = total_bytes.saturating_add(written);
+        if total_bytes > install::MAX_ARCHIVE_TOTAL_BYTES {
+            bail!(
+                "release tarball exceeds {}-byte decompression limit",
+                install::MAX_ARCHIVE_TOTAL_BYTES
+            );
+        }
         let libs = unpack_libs(
             &ar_member(&deb, "data.tar.gz").context(name.to_owned())?,
             dest,
@@ -587,8 +646,29 @@ mod tests {
         fs::create_dir(&out).unwrap();
         unpack(&tgz, &[COMPILER_PKG], &out).unwrap();
         assert!(out.join("libnpu_driver_compiler.so").is_file());
-        let err = unpack(&tgz, &[COMPILER_PKG, DRIVER_PKG], &out).unwrap_err();
+        let out2 = dir.path().join("out2");
+        fs::create_dir(&out2).unwrap();
+        let err = unpack(&tgz, &[COMPILER_PKG, DRIVER_PKG], &out2).unwrap_err();
         assert!(format!("{err:#}").contains(DRIVER_PKG));
+    }
+
+    #[test]
+    fn a_regular_file_cannot_overwrite_an_earlier_symlink_or_file() {
+        let data = tar_gz(|b| {
+            link(
+                b,
+                "usr/lib/x86_64-linux-gnu/libz.so.1",
+                "libz.so.1.0",
+            );
+            file(
+                b,
+                "usr/lib/x86_64-linux-gnu/libz.so.1",
+                b"overwrite-via-symlink",
+            );
+        });
+        let dir = tempdir::private().unwrap();
+        assert!(unpack_libs(&data, dir.path()).is_err());
+        assert!(!dir.path().join("libz.so.1.0").exists());
     }
 
     #[test]

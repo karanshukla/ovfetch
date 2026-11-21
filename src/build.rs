@@ -131,6 +131,12 @@ fn check_out_pinned_source(recipe: &BuildPlan, src: &Path) -> Result<()> {
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .args([
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "protocol.file.allow=never",
                 "clone",
                 "--depth",
                 "1",

@@ -24,11 +24,13 @@ pub(crate) fn soname(elf: &[u8]) -> Option<String> {
 }
 
 /// Every RPATH and RUNPATH entry, `None` when `elf` is not one ovfetch can read.
+/// Empty segments (`""`, leading/trailing `:`, or `::`) are preserved because
+/// the dynamic linker treats an empty segment as the current working directory.
 pub(crate) fn search_paths(elf: &[u8]) -> Option<Vec<String>> {
     let mut paths = Vec::new();
     for tag in [DT_RPATH, DT_RUNPATH] {
         for list in dynamic_strings(elf, tag)? {
-            paths.extend(list.split(':').filter(|p| !p.is_empty()).map(str::to_owned));
+            paths.extend(list.split(':').map(str::to_owned));
         }
     }
     Some(paths)
@@ -197,7 +199,13 @@ pub(crate) mod tests {
         );
         assert_eq!(
             paths(&elf),
-            Some(vec!["/opt/a".into(), "$ORIGIN".into(), "/b".into()])
+            Some(vec![
+                "/opt/a".into(),
+                "".into(),
+                "$ORIGIN".into(),
+                "".into(),
+                "/b".into()
+            ])
         );
         assert_eq!(soname(&elf).as_deref(), Some("libx.so.1"));
     }
