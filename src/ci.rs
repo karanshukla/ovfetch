@@ -355,7 +355,7 @@ fn record_wheels(
     today: Date,
     changes: &mut Vec<String>,
 ) -> Result<Vec<String>> {
-    let cutoff = days_before(today, COOLDOWN_DAYS).to_string();
+    let cutoff = days_before(today, COOLDOWN_DAYS);
     let intel_releases = upstream.github_releases(INTEL_ORT_REPO)?;
     let mut held = Vec::new();
     for (project, min) in TRACKED {
@@ -373,10 +373,15 @@ fn record_wheels(
                 }
                 continue;
             }
-            if wheel.uploaded.as_str() > cutoff.as_str() {
+            let uploaded_date = wheel.uploaded.parse::<Date>().ok();
+            if uploaded_date.is_none_or(|d| d > cutoff) {
+                let when = if wheel.uploaded.is_empty() {
+                    "unknown"
+                } else {
+                    wheel.uploaded.as_str()
+                };
                 held.push(format!(
-                    "- `{id}` (uploaded {}), recorded once it is {COOLDOWN_DAYS} days old",
-                    wheel.uploaded
+                    "- `{id}` (uploaded {when}), recorded once it is {COOLDOWN_DAYS} days old"
                 ));
                 continue;
             }
@@ -940,6 +945,17 @@ mod tests {
             uploaded(wheel("openvino", "2026.5.0", "cp313", "0b"), "2026-11-14"),
         );
         assert_eq!(discover_with(&fake, &mut data, today()).unwrap(), "");
+    }
+
+    #[test]
+    fn an_empty_or_malformed_upload_date_is_held_back() {
+        for bad_date in ["", "not-a-date", "2026-99-99"] {
+            let (mut fake, mut data) = settled();
+            let w = uploaded(wheel("openvino", "2026.5.0", "cp313", "0b"), bad_date);
+            fake.wheels.insert(0, w.clone());
+            assert_eq!(discover_with(&fake, &mut data, today()).unwrap(), "");
+            assert!(data.ledger.get(&w.ledger_id()).is_none(), "{bad_date:?}");
+        }
     }
 
     #[test]

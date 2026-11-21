@@ -13,10 +13,34 @@ use std::path::{Path, PathBuf};
 pub(crate) const SUMS: &str = "SHA256SUMS";
 pub(crate) const LOCK: &str = "ovfetch.lock.json";
 
-/// `(digest, file name)` for each line of a sums file, the two-space form
-/// `sha256sum` writes.
+fn is_valid_sum_entry(digest: &str, name: &str) -> bool {
+    digest.len() == 64
+        && digest.bytes().all(|b| b.is_ascii_hexdigit())
+        && !name.is_empty()
+        && !name.contains('/')
+        && name != "."
+        && name != ".."
+}
+
+/// `(digest, file name)` for each valid line of a sums file, the two-space
+/// form `sha256sum` writes.
 fn sums_entries(sums: &str) -> impl Iterator<Item = (&str, &str)> {
-    sums.lines().filter_map(|line| line.split_once("  "))
+    sums.lines().filter_map(|line| {
+        let (digest, name) = line.split_once("  ")?;
+        is_valid_sum_entry(digest, name).then_some((digest, name))
+    })
+}
+
+/// Reads a listed file, refusing a symlink: `verify` hashes what the loader
+/// will open, so a link there would be judged by whatever it points at.
+fn read_regular_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
+    if !fs::symlink_metadata(path)?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    fs::read(path)
 }
 
 pub(crate) fn write_sums(dir: &Path) -> Result<()> {
@@ -43,12 +67,25 @@ pub fn verify(prefix: &Path) -> Result<()> {
         )
     })?;
     let mut bad = Vec::new();
-    for (digest, name) in sums_entries(&sums) {
-        match fs::read(prefix.join(name)) {
+    let mut entry_count = 0usize;
+    for line in sums.lines() {
+        let Some((digest, name)) = line.split_once("  ") else {
+            bad.push(format!("{SUMS}: malformed line"));
+            continue;
+        };
+        if !is_valid_sum_entry(digest, name) {
+            bad.push(format!("{name}: invalid {SUMS} entry"));
+            continue;
+        }
+        entry_count += 1;
+        match read_regular_no_follow(&prefix.join(name)) {
             Ok(bytes) if net::sha256_hex(&bytes) == digest => {}
             Ok(_) => bad.push(format!("{name}: modified")),
             Err(e) => bad.push(format!("{name}: {e}")),
         }
+    }
+    if entry_count == 0 {
+        bad.push(format!("{SUMS}: empty"));
     }
     for name in untracked(prefix, &sums)? {
         bad.push(format!("{name}: not installed by ovfetch"));
@@ -303,5 +340,28 @@ mod tests {
         verify(&real).unwrap();
         // Nothing staged or set aside is left beside it.
         assert_eq!(sorted_file_names(dir.path()), ["link", "real", "staging"]);
+    }
+
+    #[test]
+    fn verify_rejects_empty_malformed_or_symlinked_sums_entries() {
+        let dir = tempdir::private().unwrap();
+        let p = dir.path();
+        fs::write(p.join(SUMS), "").unwrap();
+        assert!(verify(p).is_err(), "empty SHA256SUMS must fail");
+
+        fs::write(p.join(SUMS), "not a valid sums line\n").unwrap();
+        assert!(verify(p).is_err(), "malformed line must fail");
+
+        let digest = net::sha256_hex(b"secret");
+        fs::write(p.join(SUMS), format!("{digest}  ../outside\n")).unwrap();
+        assert!(verify(p).is_err(), "path traversal in SHA256SUMS must fail");
+
+        fs::write(p.join("target"), b"secret").unwrap();
+        symlink("target", p.join("liblink.so")).unwrap();
+        fs::write(p.join(SUMS), format!("{digest}  liblink.so\n")).unwrap();
+        assert!(
+            verify(p).is_err(),
+            "symlinked primary entry must fail O_NOFOLLOW"
+        );
     }
 }

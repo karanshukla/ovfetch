@@ -230,14 +230,12 @@ impl Read for RangeReader {
 impl Seek for RangeReader {
     fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
         let pos = match to {
-            SeekFrom::Start(o) => o as i64,
-            SeekFrom::Current(o) => self.pos as i64 + o,
-            SeekFrom::End(o) => self.size as i64 + o,
-        };
-        if pos < 0 {
-            return Err(io::Error::other("seek before start"));
+            SeekFrom::Start(o) => Some(o),
+            SeekFrom::Current(o) => self.pos.checked_add_signed(o),
+            SeekFrom::End(o) => self.size.checked_add_signed(o),
         }
-        self.pos = pos as u64;
+        .ok_or_else(|| io::Error::other("seek before start or overflow"))?;
+        self.pos = pos;
         Ok(self.pos)
     }
 }

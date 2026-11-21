@@ -45,13 +45,20 @@ fn fetch_with(
     Err(last.unwrap_or_else(|| anyhow::anyhow!("no source to download from")))
 }
 
+/// Maximum uncompressed size of a single archive entry (1 GiB).
+pub(crate) const MAX_ARCHIVE_ENTRY_BYTES: u64 = 1 << 30;
+/// Maximum cumulative uncompressed bytes extracted from an archive (2 GiB).
+pub(crate) const MAX_ARCHIVE_TOTAL_BYTES: u64 = 2 << 30;
+
 pub(crate) fn unzip(
     archive: &Path,
     dest: &Path,
     keep: impl Fn(&str) -> bool,
     flatten: bool,
 ) -> Result<()> {
+    use std::io::Read;
     let mut zip = zip::ZipArchive::new(fs::File::open(archive)?)?;
+    let mut total_bytes = 0u64;
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i)?;
         let Some(rel) = entry.enclosed_name() else {
@@ -73,7 +80,16 @@ pub(crate) fn unzip(
             .create_new(true)
             .open(&out)
             .with_context(|| format!("unpacking {name} to {}", out.display()))?;
-        std::io::copy(&mut entry, &mut file)?;
+        let remaining = MAX_ARCHIVE_TOTAL_BYTES.saturating_sub(total_bytes);
+        let limit = MAX_ARCHIVE_ENTRY_BYTES.min(remaining);
+        let written = std::io::copy(&mut (&mut entry).take(limit + 1), &mut file)?;
+        if written > MAX_ARCHIVE_ENTRY_BYTES {
+            bail!("archive entry {name} exceeds {MAX_ARCHIVE_ENTRY_BYTES}-byte size limit");
+        }
+        total_bytes = total_bytes.saturating_add(written);
+        if total_bytes > MAX_ARCHIVE_TOTAL_BYTES {
+            bail!("archive exceeds {MAX_ARCHIVE_TOTAL_BYTES}-byte decompression limit");
+        }
     }
     Ok(())
 }
