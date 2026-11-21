@@ -16,12 +16,14 @@ else
     "$workflow" >"$work/guard"
 fi
 
-# The stub answers the two queries guard makes: the changed-files list
-# (`@tsv`) and the ledger patch. GH_FAIL makes the patch query fail.
+# The stub answers the queries guard makes: the PR's head and file count,
+# the changed-files list (`@tsv`) and the ledger patch. GH_FAIL makes the
+# patch query fail; STUB_COUNT overrides the file count the PR reports.
 mkdir "$work/bin"
 cat >"$work/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 case "$*" in
+  *head.sha*) printf '%s\t%s\n' "${STUB_HEAD:-abc}" "${STUB_COUNT:-$(wc -l <"$STUB_DIR/files.tsv")}" ;;
   *@tsv*) cat "$STUB_DIR/files.tsv" ;;
   *.patch*)
     [ -z "${GH_FAIL:-}" ] || { echo "gh: HTTP 502" >&2; exit 1; }
@@ -38,7 +40,7 @@ failures=0
 # written by the caller.
 expect() {
   local want="$1" name="$2" author="$3" got
-  if (cd "$work/run" && env PATH="$work/bin:$PATH" STUB_DIR="$work" GH_FAIL="${4:-}" \
+  if (cd "$work/run" && env PATH="$work/bin:$PATH" STUB_DIR="$work" GH_FAIL="${4:-}" HEAD_SHA=abc \
     GITHUB_STEP_SUMMARY="$work/summary" REPO=o/r PR=1 AUTHOR="$author" OWNER=karanshukla \
     bash "$work/guard" >/dev/null 2>&1); then got=pass; else got=fail; fi
   if [ "$got" = "$want" ]; then
@@ -88,5 +90,13 @@ expect fail "moving a file out of src/ is judged on its old path" "$bot"
 
 files $'src/main.rs\tmodified\t'
 expect fail "discover may not change src/" "$bot"
+
+files $'README.md\tmodified\t'
+STUB_COUNT=3000 expect fail "a list that may be cut off at 3000 files fails" someone
+STUB_COUNT=2 expect fail "a list shorter than the PR's file count fails" someone
+STUB_HEAD=def expect fail "a push mid-check fails" someone
+
+files $'.cargo/config.toml\tadded\t'
+expect fail "anyone else may not add a file outside the docs" someone
 
 [ "$failures" -eq 0 ] || { echo "$failures guard case(s) failed" >&2; exit 1; }

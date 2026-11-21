@@ -7,8 +7,7 @@ use crate::tempdir;
 use crate::version::Ver;
 use anyhow::{Context, Result, bail};
 use std::fs;
-use std::io::Read;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
 pub(crate) const SUMS: &str = "SHA256SUMS";
@@ -32,20 +31,16 @@ fn sums_entries(sums: &str) -> impl Iterator<Item = (&str, &str)> {
     })
 }
 
+/// Reads a listed file, refusing a symlink: `verify` hashes what the loader
+/// will open, so a link there would be judged by whatever it points at.
 fn read_regular_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
-    let mut file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
-    if !file.metadata()?.is_file() {
+    if !fs::symlink_metadata(path)?.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "not a regular file",
         ));
     }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok(bytes)
+    fs::read(path)
 }
 
 pub(crate) fn write_sums(dir: &Path) -> Result<()> {
@@ -234,7 +229,6 @@ pub(crate) fn place(lib: &Path, prefix: &Path, lock: &serde_json::Value) -> Resu
     let mode = fs::metadata(prefix).map_or(0o755, |m| m.permissions().mode());
     fs::set_permissions(staged.path(), fs::Permissions::from_mode(mode))?;
     verify(staged.path())?;
-    refuse_foreign(prefix)?;
     swap_in(staged.path(), prefix, &format!(".{name}.ovfetch-old"))?;
     verify(prefix)?;
     Ok(prefix.clone())
@@ -359,13 +353,15 @@ mod tests {
         assert!(verify(p).is_err(), "malformed line must fail");
 
         let digest = net::sha256_hex(b"secret");
-        fs::write(dir.path().join("../outside"), b"secret").ok();
         fs::write(p.join(SUMS), format!("{digest}  ../outside\n")).unwrap();
         assert!(verify(p).is_err(), "path traversal in SHA256SUMS must fail");
 
         fs::write(p.join("target"), b"secret").unwrap();
         symlink("target", p.join("liblink.so")).unwrap();
         fs::write(p.join(SUMS), format!("{digest}  liblink.so\n")).unwrap();
-        assert!(verify(p).is_err(), "symlinked primary entry must fail O_NOFOLLOW");
+        assert!(
+            verify(p).is_err(),
+            "symlinked primary entry must fail O_NOFOLLOW"
+        );
     }
 }

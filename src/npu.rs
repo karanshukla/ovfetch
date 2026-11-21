@@ -73,18 +73,10 @@ pub struct Plan {
 /// Which release, and how much of it. The compiler has to come from the same
 /// release as the driver that loads it.
 fn choose(host: &Machine, data: &Data, opts: &Options) -> Result<(String, Mode)> {
-    let want = match &opts.driver {
-        Some(raw) => Some(
-            Ver::parse(raw)
-                .filter(|v| v.0.len() >= 2 && v.to_string() == raw.trim_start_matches('v'))
-                .with_context(|| format!("invalid NPU driver version {raw:?}"))?,
-        ),
-        None => None,
-    };
     match (&host.npu_driver, opts.full) {
         (Some(have), false) => {
-            if let Some(want) = &want
-                && Some(want) != Ver::parse(have).as_ref()
+            if let Some(want) = &opts.driver
+                && Ver::parse(want) != Ver::parse(have)
             {
                 bail!(
                     "the host's NPU driver is {have}, and its compiler must come from the same \
@@ -94,8 +86,8 @@ fn choose(host: &Machine, data: &Data, opts: &Options) -> Result<(String, Mode)>
             Ok((have.clone(), Mode::Compiler))
         }
         _ => {
-            if let Some(want) = want {
-                return Ok((want.to_string(), Mode::Full));
+            if let Some(want) = &opts.driver {
+                return Ok((want.clone(), Mode::Full));
             }
             let codenames: Vec<&str> = host
                 .npus()
@@ -655,11 +647,7 @@ mod tests {
     #[test]
     fn a_regular_file_cannot_overwrite_an_earlier_symlink_or_file() {
         let data = tar_gz(|b| {
-            link(
-                b,
-                "usr/lib/x86_64-linux-gnu/libz.so.1",
-                "libz.so.1.0",
-            );
+            link(b, "usr/lib/x86_64-linux-gnu/libz.so.1", "libz.so.1.0");
             file(
                 b,
                 "usr/lib/x86_64-linux-gnu/libz.so.1",
