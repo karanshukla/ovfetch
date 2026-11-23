@@ -338,6 +338,16 @@ pub fn github_tag_commit(repo: &str, tag: &str) -> Result<String> {
         .with_context(|| format!("GitHub returned no commit for {repo} {tag}"))
 }
 
+/// Whether `repo` is there at all. A 404, 410 or 451 for the repository
+/// itself means it is gone or withdrawn; any other failure is an error.
+pub fn github_repo_exists(repo: &str) -> Result<bool> {
+    match net::get_json(&format!("https://api.github.com/repos/{repo}")) {
+        Ok(_) => Ok(true),
+        Err(err) if matches!(net::http_status(&err), Some(404 | 410 | 451)) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
 /// Filenames PyPI reports a PEP 740 provenance attestation for.
 pub fn pypi_provenance(project: &str) -> Result<Vec<String>> {
     let json = net::get_json_accept(
