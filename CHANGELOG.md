@@ -5,6 +5,22 @@ All notable changes to ovfetch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-11-23
+
+### Security
+
+- Updates `url` to 2.5.9 for RUSTSEC-2026-0592, a stack overflow in `Url::origin()` on nested `blob:` URLs.
+- Archive extraction (`install`, `npu install`) stops at 1 GiB for one entry and 2 GiB in total, and an `ar` member over 1 GiB is refused.
+- `npu install` writes each file with create-new, so a regular file can no longer overwrite an earlier symlink or file from the same package.
+- `verify` refuses a `SHA256SUMS` that is empty, has a malformed line, or lists a name containing a path separator, `.` or `..`. It no longer follows a symlink for a listed file.
+- Library search path checks (`RUNPATH`) refuse an empty segment, which the dynamic linker reads as the current directory, and `$ORIGIN` paths that climb with `..`. Subdirectories of `$ORIGIN` still pass.
+- `ci audit` holds back a wheel whose upload date is empty or can't be parsed, instead of recording it.
+- The PR ledger guard also runs when a PR's base branch is edited, rechecks the PR head around its file list, and fails when the list is incomplete.
+
+### Changed
+
+- The README and the documents in `docs/`, and `SECURITY.md`, are shorter and clearer.
+
 ## [0.7.0] - 2026-11-17
 
 ### Changed
@@ -116,7 +132,8 @@ Breaking for library users: `resolve::resolve`, `Artifact` and `Kind` change (se
 
 - Initial release: resolve, verify and install prebuilt ONNX Runtime and OpenVINO for Intel NPUs.
 
-[Unreleased]: https://github.com/karanshukla/ovfetch/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/karanshukla/ovfetch/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/karanshukla/ovfetch/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/karanshukla/ovfetch/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/karanshukla/ovfetch/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/karanshukla/ovfetch/compare/v0.4.1...v0.5.0
