@@ -103,3 +103,8 @@ measured_note = "Measured 2026-09-28 on a Dell XPS 13 (WCL) with driver 1.35.0 a
 version = "1.38.0"
 openvino = "2026.3.1"
 platforms = ["Meteor Lake", "Arrow Lake", "Lunar Lake", "Panther Lake", "Wildcat Lake"]
+
+[[driver]]
+version = "1.39.1"
+openvino = "2026.4.1"
+platforms = ["Meteor Lake", "Arrow Lake", "Lunar Lake", "Panther Lake", "Wildcat Lake", "Nova Lake"]
