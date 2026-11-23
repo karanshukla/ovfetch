@@ -107,11 +107,38 @@ fn get(url: &str, headers: &[(&str, &str)]) -> Result<ureq::http::Response<ureq:
             continue;
         }
         if !status.is_success() {
-            bail!("GET {url}: HTTP {status}");
+            return Err(HttpStatus {
+                url,
+                code: status.as_u16(),
+                text: status.to_string(),
+            }
+            .into());
         }
         return Ok(resp);
     }
     bail!("more than {MAX_REDIRECTS} redirects from {url}")
+}
+
+/// A non-success answer, kept typed so a caller can tell "the server said
+/// not found" from a transport failure.
+#[derive(Debug)]
+pub struct HttpStatus {
+    pub url: String,
+    pub code: u16,
+    pub text: String,
+}
+
+impl std::fmt::Display for HttpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GET {}: HTTP {}", self.url, self.text)
+    }
+}
+
+impl std::error::Error for HttpStatus {}
+
+/// The HTTP status behind `err`, when it is one.
+pub fn http_status(err: &anyhow::Error) -> Option<u16> {
+    err.downcast_ref::<HttpStatus>().map(|e| e.code)
 }
 
 /// Where a `Location` header points. An absolute or scheme-relative one is

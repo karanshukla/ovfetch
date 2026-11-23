@@ -20,6 +20,8 @@ pub trait Upstream {
     fn github_release(&self, repo: &str, tag: &str) -> Result<GithubRelease>;
     fn github_raw(&self, repo: &str, git_ref: &str, path: &str) -> Result<String>;
     fn github_tag_commit(&self, repo: &str, tag: &str) -> Result<String>;
+    /// False when GitHub no longer serves the repository itself.
+    fn github_repo_exists(&self, repo: &str) -> Result<bool>;
     /// Writes `url` to `dest` and returns the sha256 of what it wrote.
     fn download(&self, url: &str, dest: &Path) -> Result<String>;
 }
@@ -60,6 +62,10 @@ impl Upstream for Network {
         sources::github_tag_commit(repo, tag)
     }
 
+    fn github_repo_exists(&self, repo: &str) -> Result<bool> {
+        sources::github_repo_exists(repo)
+    }
+
     fn download(&self, url: &str, dest: &Path) -> Result<String> {
         net::download(url, dest)
     }
@@ -91,6 +97,8 @@ pub(crate) mod fake {
         pub(crate) raw_files: HashMap<String, String>,
         /// `repo tag` to the commit it points at.
         pub(crate) tags: HashMap<String, String>,
+        /// Repositories GitHub no longer serves.
+        pub(crate) repos_gone: std::collections::HashSet<String>,
         /// URL to the sha256 a download of it yields.
         pub(crate) downloads: HashMap<String, String>,
         pub(crate) downloaded: RefCell<Vec<String>>,
@@ -200,10 +208,19 @@ pub(crate) mod fake {
         }
 
         fn github_tag_commit(&self, repo: &str, tag: &str) -> Result<String> {
-            self.tags
-                .get(&format!("{repo} {tag}"))
-                .cloned()
-                .with_context(|| format!("no fake tag {repo} {tag}"))
+            match self.tags.get(&format!("{repo} {tag}")) {
+                Some(commit) => Ok(commit.clone()),
+                None => Err(crate::net::HttpStatus {
+                    url: format!("https://api.github.com/repos/{repo}/git/ref/tags/{tag}"),
+                    code: 404,
+                    text: "404 Not Found".into(),
+                }
+                .into()),
+            }
+        }
+
+        fn github_repo_exists(&self, repo: &str) -> Result<bool> {
+            Ok(!self.repos_gone.contains(repo))
         }
 
         fn download(&self, url: &str, _dest: &Path) -> Result<String> {

@@ -73,6 +73,7 @@ pub fn audit_with(
     seed: usize,
 ) -> Result<String> {
     let mut problems = Vec::new();
+    let mut unavailable = Vec::new();
     let mut fetched = Fetched::default();
     let mut downloadable: Vec<(PypiFile, String)> = Vec::new();
 
@@ -97,7 +98,7 @@ pub fn audit_with(
             problems.push(format!("- `{}`: {err:#}", entry.id));
         }
     }
-    audit_recipes(upstream, data, &mut problems);
+    audit_recipes(upstream, data, &mut problems, &mut unavailable);
     let sampled = sample.min(downloadable.len());
     spot_download(
         upstream,
@@ -109,7 +110,7 @@ pub fn audit_with(
     )?;
 
     let checked = data.ledger.list.len() + data.builds.list.len();
-    audit_report(checked, sampled, &problems)
+    audit_report(checked, sampled, &problems, &unavailable)
 }
 
 /// Checks that PyPI and its mirrors still agree with the ledger on one wheel.
@@ -173,7 +174,18 @@ fn audit_github_asset(
 
 /// Every recipe's OpenVINO input must be in the ledger, and its tag must
 /// still point at the pinned commit.
-fn audit_recipes(upstream: &dyn Upstream, data: &Data, problems: &mut Vec<String>) {
+/// A recipe's source repository that GitHub no longer serves is reported as
+/// unavailable, not as a mismatch: nothing recorded was contradicted, it just
+/// cannot be compared. A tag that is gone from a repository that is still
+/// there is a change to a pinned source, so it stays a problem (pinned by
+/// `tests::a_recipes_repository_that_is_gone_is_unavailable_not_a_mismatch`,
+/// `tests::a_recipes_tag_deleted_from_a_live_repository_is_a_problem`).
+fn audit_recipes(
+    upstream: &dyn Upstream,
+    data: &Data,
+    problems: &mut Vec<String>,
+    unavailable: &mut Vec<String>,
+) {
     for recipe in &data.builds.list {
         let id = format!("build {} {}", recipe.git_repo, recipe.git_tag);
         if data.ledger.get(&recipe.openvino_wheel).is_none() {
@@ -188,6 +200,19 @@ fn audit_recipes(upstream: &dyn Upstream, data: &Data, problems: &mut Vec<String
                 "- `{id}`: tag now points at {commit}, recipe pins {}",
                 recipe.git_commit
             )),
+            Err(e) if crate::net::http_status(&e) == Some(404) => {
+                match upstream.github_repo_exists(&recipe.git_repo) {
+                    Ok(false) => unavailable.push(format!(
+                        "- `{id}`: GitHub no longer serves {}, so the pinned commit {} cannot be fetched or compared",
+                        recipe.git_repo, recipe.git_commit
+                    )),
+                    Ok(true) => problems.push(format!(
+                        "- `{id}`: the tag no longer exists in {}, which recipe pins at {}",
+                        recipe.git_repo, recipe.git_commit
+                    )),
+                    Err(check) => problems.push(format!("- `{id}`: {e:#}; and asking whether the repository exists failed: {check:#}")),
+                }
+            }
             Err(e) => problems.push(format!("- `{id}`: {e:#}")),
         }
     }
@@ -231,10 +256,27 @@ fn spot_download(
     Ok(())
 }
 
-fn audit_report(checked: usize, sampled: usize, problems: &[String]) -> Result<String> {
+fn audit_report(
+    checked: usize,
+    sampled: usize,
+    problems: &[String],
+    unavailable: &[String],
+) -> Result<String> {
     let mut report = format!("Audited {checked} recorded artifacts, spot-downloaded {sampled}.\n");
+    if !unavailable.is_empty() {
+        report.push_str(&format!(
+            "\n**{} recorded source(s) unavailable.** Not a mismatch: nothing reachable contradicted the ledger, \
+             but these could not be compared, and anything that builds from them cannot work until they are back.\n\n{}\n",
+            unavailable.len(),
+            unavailable.join("\n")
+        ));
+    }
     if problems.is_empty() {
-        report.push_str("\nEvery source still agrees with the ledger.\n");
+        if unavailable.is_empty() {
+            report.push_str("\nEvery source still agrees with the ledger.\n");
+        } else {
+            report.push_str("\nEvery source that could be reached still agrees with the ledger.\n");
+        }
         return Ok(report);
     }
     report.push_str(&format!(
@@ -763,6 +805,82 @@ mod tests {
         );
         assert!(
             report.contains("tag now points at deadbeef, recipe pins c0ffee"),
+            "{report}"
+        );
+    }
+
+    /// The recipe the audit tests share, with its tag served at its pinned commit.
+    fn with_recipe() -> (Fake, Data) {
+        let (mut fake, mut data) = recorded();
+        data.builds.list.push(Build {
+            onnxruntime: "1.24.1".into(),
+            openvino: "2026.4.1".into(),
+            git_repo: "microsoft/onnxruntime".into(),
+            git_tag: "v1.24.1".into(),
+            git_commit: "c0ffee".into(),
+            openvino_wheel: data.ledger.list[0].id.clone(),
+            build_args: vec![],
+            cmake_defines: vec![],
+            note: None,
+        });
+        fake.tags
+            .insert("microsoft/onnxruntime v1.24.1".into(), "c0ffee".into());
+        (fake, data)
+    }
+
+    #[test]
+    fn a_recipes_repository_that_is_gone_is_unavailable_not_a_mismatch() {
+        let (mut fake, data) = with_recipe();
+        fake.tags.clear();
+        fake.repos_gone.insert("microsoft/onnxruntime".into());
+        let report = audit_with(&fake, &data, 0, 0).unwrap();
+        assert!(
+            report.contains("**1 recorded source(s) unavailable.**"),
+            "{report}"
+        );
+        assert!(
+            report.contains("GitHub no longer serves microsoft/onnxruntime"),
+            "{report}"
+        );
+        assert!(!report.contains("no longer match"), "{report}");
+        assert!(!report.contains("compromise"), "{report}");
+        assert!(
+            report.contains("Every source that could be reached still agrees"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn a_recipes_tag_deleted_from_a_live_repository_is_a_problem() {
+        let (mut fake, data) = with_recipe();
+        fake.tags.clear();
+        let report = audit_failure(&fake, &data);
+        assert!(
+            report.contains("**1 artifact(s) no longer match"),
+            "{report}"
+        );
+        assert!(
+            report.contains("the tag no longer exists in microsoft/onnxruntime"),
+            "{report}"
+        );
+        assert!(!report.contains("unavailable"), "{report}");
+    }
+
+    #[test]
+    fn a_real_mismatch_still_fails_beside_an_unavailable_source() {
+        let (mut fake, data) = with_recipe();
+        fake.tags.clear();
+        fake.repos_gone.insert("microsoft/onnxruntime".into());
+        let filename = fake.wheels[0].filename.clone();
+        fake.mirror_disagrees.insert(filename, "ee".repeat(32));
+        let report = audit_failure(&fake, &data);
+        assert!(
+            report.contains("**1 artifact(s) no longer match"),
+            "{report}"
+        );
+        assert!(report.contains("SOURCES DISAGREE"), "{report}");
+        assert!(
+            report.contains("**1 recorded source(s) unavailable.**"),
             "{report}"
         );
     }
