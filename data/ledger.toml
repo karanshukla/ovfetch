@@ -199,3 +199,18 @@ first_seen = "2026-10-19"
 id = "pypi/openvino/openvino-2025.4.0-20398-cp314-cp314-manylinux2014_x86_64.whl"
 digest = "ac6cf3a21418fee22283326c5e9059e844a84c763651cd2faaaf1e033ebb72d0"
 first_seen = "2026-10-19"
+
+[[artifact]]
+id = "github/intel/linux-npu-driver/v1.39.1/intel-linux-npu-driver-1.39.1.20261119-44517102376-android-x86_64.tar.gz"
+digest = "1b33bade4bd4257227fbe09badfcdc4b11129ec55188529ed5bef0e77c3a855c"
+first_seen = "2026-11-23"
+
+[[artifact]]
+id = "github/intel/linux-npu-driver/v1.39.1/linux-npu-driver-v1.39.1.20261119-44517102376-ubuntu2404.tar.gz"
+digest = "884a461b152281f259cd6759a8ae17a77968712b939543607360ec562d4741fc"
+first_seen = "2026-11-23"
+
+[[artifact]]
+id = "github/intel/linux-npu-driver/v1.39.1/linux-npu-driver-v1.39.1.20261119-44517102376-ubuntu2604.tar.gz"
+digest = "8003e3edc70ba5e4015df3c526a263fc950ee451d05d10c32813debad8957e96"
+first_seen = "2026-11-23"
