@@ -5,6 +5,12 @@ All notable changes to ovfetch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-11-27
+
+### Fixed
+
+- `ci audit` reports a recipe whose repository is missing as unavailable, not as a mismatch.
+
 ## [0.7.1] - 2026-11-23
 
 ### Security
@@ -133,6 +139,7 @@ Breaking for library users: `resolve::resolve`, `Artifact` and `Kind` change (se
 - Initial release: resolve, verify and install prebuilt ONNX Runtime and OpenVINO for Intel NPUs.
 
 [Unreleased]: https://github.com/karanshukla/ovfetch/compare/v0.7.1...HEAD
+[0.7.2]: https://github.com/karanshukla/ovfetch/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/karanshukla/ovfetch/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/karanshukla/ovfetch/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/karanshukla/ovfetch/compare/v0.5.0...v0.6.0
